@@ -1,0 +1,26 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html, body {
+  touch-action: manipulation;
+  user-select: none;
+  overflow: hidden;
+  background-color: #f1f5f9; /* Slate-100: เทาอ่อนสบายตา */
+  color: #334155; /* Slate-700: สีตัวหนังสือเทาเข้ม อ่านง่าย */
+}
+
+/* Scrollbar แบบ Minimal */
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent; 
+}
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1; /* สีเทาอ่อนๆ */
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
