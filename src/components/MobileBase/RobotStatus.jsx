@@ -2,7 +2,6 @@ import React, { useState, useEffect, useRef } from 'react';
 import * as ROSLIB from 'roslib'; 
 import { QrCode, Gauge } from 'lucide-react';
 
-// ✅ รับ ros เป็น props (ตัวสุดท้ายแล้ว!)
 const RobotStatus = ({ ros }) => {
   // --- STATE เก็บค่าความเร็ว (ค่าเดียว) ---
   const [speed, setSpeed] = useState(0.00);
@@ -35,7 +34,7 @@ const RobotStatus = ({ ros }) => {
       // Cleanup: ยกเลิกการฟังเมื่อ Component ถูกทำลาย หรือ ros เปลี่ยน
       if (poseListener.current) poseListener.current.unsubscribe();
     };
-  }, [ros]); // ✅ ทำงานใหม่เมื่อได้รับ ros object
+  }, [ros]); // 
 
   return (
     <div className="grid grid-cols-2 gap-4 h-full">
