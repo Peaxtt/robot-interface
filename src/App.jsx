@@ -10,7 +10,6 @@ function App() {
   const [activeTab, setActiveTab] = useState('mobile');
   const [controlMode, setControlMode] = useState('MANUAL');
   
-  // ✅ เปลี่ยนจาก useRef เป็น useState เพื่อให้ลูกๆ re-render เมื่อต่อติด
   const [ros, setRos] = useState(null);
   const [rosStatus, setRosStatus] = useState('DISCONNECTED'); 
 
@@ -29,7 +28,7 @@ function App() {
         newRos.on('connection', () => {
           console.log('✅ App: ROS Connected');
           setRosStatus('CONNECTED');
-          setRos(newRos); // ส่ง object นี้ไปให้ลูกๆ
+          setRos(newRos);
         });
 
         newRos.on('error', (error) => {
@@ -40,7 +39,7 @@ function App() {
         newRos.on('close', () => {
           console.log('🔌 App: ROS Closed');
           setRosStatus('DISCONNECTED');
-          setRos(null); // ล้างค่าเมื่อหลุด
+          setRos(null);
           
           // Auto Reconnect ใน 3 วิ
           setTimeout(() => connectROS(), 3000); 
@@ -127,7 +126,7 @@ function App() {
           {activeTab === 'mobile' ? (
             <div className="flex flex-col gap-6 h-full">
               <div className="flex-[2] overflow-hidden">
-                {/* ✅ ส่งตัวแปร ros (state) ลงไป */}
+                {/* ส่งตัวแปร ros (state) ลงไป */}
                 {controlMode === 'MANUAL' 
                   ? <OpenLoopControl ros={ros} /> 
                   : <ClosedLoopControl ros={ros} />
