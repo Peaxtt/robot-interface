@@ -75,7 +75,7 @@ class PathFollower(Node):
             return
 
         cmd = Twist()
-        cmd.linear.x = min(self.Kp_linear * distance, 2.0)
+        cmd.linear.x = min(self.Kp_linear * distance, 0.5) # จำกัดความเร็วสูงสุด
         cmd.angular.z = self.Kp_angular * angle_err
         self.cmd_vel_pub.publish(cmd)
 
