@@ -211,7 +211,6 @@ const ClosedLoopControl = ({ ros }) => {
                                     <span className={`w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold ${isCompleted ? 'bg-slate-200 text-slate-400' : 'bg-blue-100 text-blue-600'}`}>
                                         {idx + 1}
                                     </span>
-                                    {/* ✅ เอา line-through ออก แต่ยังคงสีเทาไว้ถ้าเสร็จแล้ว */}
                                     <span className={`font-mono font-bold text-sm ${isCompleted ? 'text-slate-400' : 'text-slate-600'}`}>
                                         TARGET ({wp.x}, {wp.y})
                                     </span>
