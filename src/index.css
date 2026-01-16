@@ -6,8 +6,8 @@ html, body {
   touch-action: manipulation;
   user-select: none;
   overflow: hidden;
-  background-color: #f1f5f9; /* Slate-100: เทาอ่อนสบายตา */
-  color: #334155; /* Slate-700: สีตัวหนังสือเทาเข้ม อ่านง่าย */
+  background-color: #f1f5f9; 
+  color: #334155; 
 }
 
 /* Scrollbar แบบ Minimal */
@@ -18,7 +18,7 @@ html, body {
   background: transparent; 
 }
 ::-webkit-scrollbar-thumb {
-  background: #cbd5e1; /* สีเทาอ่อนๆ */
+  background: #cbd5e1; 
   border-radius: 3px;
 }
 ::-webkit-scrollbar-thumb:hover {
