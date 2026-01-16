@@ -5,95 +5,100 @@ from turtlesim.msg import Pose
 from std_msgs.msg import String
 import json
 import math
+import time
 
 class PathFollower(Node):
     def __init__(self):
         super().__init__('path_follower_node')
-        
-        self.Kp_linear = 1.5
-        self.Kp_angular = 6.0
-        self.stop_distance = 0.1
+        self.Kp_linear = 1.2
+        self.Kp_angular = 5.0
+        self.stop_distance = 0.05
         
         self.pose = None
-        self.path_queue = []
-        self.current_target = None
         self.is_moving = False
+        self.initial_theta = None # จำมุมตอนเริ่มรัน Path ทั้งหมด
 
         self.cmd_vel_pub = self.create_publisher(Twist, '/turtle1/cmd_vel', 10)
         self.pose_sub = self.create_subscription(Pose, '/turtle1/pose', self.pose_callback, 10)
+        # รับพิกัดแบบเมตรที่จะให้เลื่อนจากจุดปัจจุบัน (Delta)
         self.path_sub = self.create_subscription(String, '/navigation/path', self.path_callback, 10)
         
-        self.timer = self.create_timer(0.05, self.control_loop)
-        self.get_logger().info("✅ Path Follower Ready! (With STOP system)")
+        self.get_logger().info("✅ Smart Path Follower Ready (Relative Vector Mode)")
 
     def pose_callback(self, msg):
         self.pose = msg
 
     def path_callback(self, msg):
         try:
-            new_path = json.loads(msg.data)
-            
-            # ✅✅✅ เพิ่ม Logic STOP ตรงนี้
-            if len(new_path) == 0:
-                self.get_logger().warn("🛑 STOP COMMAND RECEIVED!")
-                self.path_queue = []       # ล้างคิว
-                self.current_target = None # ยกเลิกเป้าหมาย
-                self.is_moving = False     # หยุดสถานะเดิน
-                self.stop_robot()          # สั่งล้อหยุดหมุน
+            # ข้อมูลที่ส่งมาจะเป็นรายการเวกเตอร์สัมพัทธ์ [[dx1, dy1], [dx2, dy2], ...]
+            vectors = json.loads(msg.data)
+            if not vectors or len(vectors) == 0:
+                self.stop_robot()
                 return
 
-            if new_path:
-                self.get_logger().info(f"📥 Received Path: {len(new_path)} points")
-                self.path_queue = new_path
-                self.current_target = self.path_queue.pop(0)
-                self.is_moving = True
+            self.initial_theta = self.pose.theta # จำมุมก่อนเริ่ม
+            
+            for dx, dy in vectors:
+                self.get_logger().info(f"🚀 Moving by Vector: x={dx}, y={dy}")
+                # คำนวณจุดหมายจริงในโลกของเต่า (จุดปัจจุบัน + ระยะที่สั่ง)
+                target_x = self.pose.x + dx
+                target_y = self.pose.y + dy
+                self.drive_to_target(target_x, target_y)
+
+            # เมื่อครบทุกจุด หมุนกลับทิศเดิม
+            self.get_logger().info("🔄 Aligning to Initial Heading...")
+            self.align_to_angle(self.initial_theta)
+            
+            self.get_logger().info("🏁 Mission Complete!")
         except Exception as e:
-            self.get_logger().error(f"Path Error: {e}")
+            self.get_logger().error(f"Error: {e}")
 
-    def control_loop(self):
-        if not self.pose or not self.is_moving or not self.current_target:
-            return
+    def drive_to_target(self, tx, ty):
+        while rclpy.ok():
+            rclpy.spin_once(self, timeout_sec=0.01)
+            dx = tx - self.pose.x
+            dy = ty - self.pose.y
+            dist = math.sqrt(dx**2 + dy**2)
+            
+            if dist < self.stop_distance:
+                break
 
-        tx, ty = self.current_target
-        dx = tx - self.pose.x
-        dy = ty - self.pose.y
-        distance = math.sqrt(dx**2 + dy**2)
-        target_theta = math.atan2(dy, dx)
-        angle_err = target_theta - self.pose.theta
+            target_theta = math.atan2(dy, dx)
+            err_th = self.normalize_angle(target_theta - self.pose.theta)
 
-        while angle_err > math.pi: angle_err -= 2 * math.pi
-        while angle_err < -math.pi: angle_err += 2 * math.pi
+            cmd = Twist()
+            cmd.linear.x = min(self.Kp_linear * dist, 1.0)
+            cmd.angular.z = self.Kp_angular * err_th
+            self.cmd_vel_pub.publish(cmd)
+            time.sleep(0.05)
+        self.stop_robot()
 
-        if distance < self.stop_distance:
-            self.get_logger().info(f"📍 Reached ({tx}, {ty})")
-            if self.path_queue:
-                self.current_target = self.path_queue.pop(0)
-            else:
-                self.get_logger().info("🏁 Path Completed!")
-                self.is_moving = False
-                self.stop_robot()
-            return
-
-        cmd = Twist()
-        cmd.linear.x = min(self.Kp_linear * distance, 0.5) # จำกัดความเร็วสูงสุด
-        cmd.angular.z = self.Kp_angular * angle_err
-        self.cmd_vel_pub.publish(cmd)
+    def align_to_angle(self, target_angle):
+        while rclpy.ok():
+            rclpy.spin_once(self, timeout_sec=0.01)
+            err_th = self.normalize_angle(target_angle - self.pose.theta)
+            if abs(err_th) < 0.02:
+                break
+            cmd = Twist()
+            cmd.angular.z = self.Kp_angular * err_th
+            self.cmd_vel_pub.publish(cmd)
+            time.sleep(0.05)
+        self.stop_robot()
 
     def stop_robot(self):
-        # สั่งความเร็ว 0 ทันที
-        stop_cmd = Twist()
-        self.cmd_vel_pub.publish(stop_cmd)
+        self.cmd_vel_pub.publish(Twist())
+
+    def normalize_angle(self, angle):
+        while angle > math.pi: angle -= 2.0 * math.pi
+        while angle < -math.pi: angle += 2.0 * math.pi
+        return angle
 
 def main(args=None):
     rclpy.init(args=args)
     node = PathFollower()
-    try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
-        node.stop_robot()
-    finally:
-        node.destroy_node()
-        rclpy.shutdown()
+    rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
 
 if __name__ == '__main__':
     main()

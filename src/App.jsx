@@ -15,7 +15,7 @@ function App() {
 
   useEffect(() => {
     // ⚠️ แก้ IP ให้ตรงกับหุ่นจริง (เช่น 10.61.6.65)
-    const ROS_URL = 'ws://127.0.0.1:9090'; 
+    const ROS_URL = 'ws://10.61.6.65:9090';
 
     const connectROS = () => {
       try {
