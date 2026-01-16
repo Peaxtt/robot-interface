@@ -116,7 +116,7 @@ const OpenLoopControl = () => {
     if (isLocked || isBusy) return;
     setActiveBtn(direction);
 
-    // ✅✅✅ แก้ตรงนี้: ถ้าโหมด Distance ให้ใช้ความเร็ว 0.5 เสมอ
+    // ความเร็วของ mode Distance
     const speed = controlMode === 'DISTANCE' ? 0.5 : getSpeedValue();
     
     let lx = 0.0, az = 0.0;
@@ -135,7 +135,6 @@ const OpenLoopControl = () => {
         moveTimer.current = setInterval(() => publishVelocity(lx, az), 250);
 
     } else {
-        // Distance Mode (Fixed Speed 0.5)
         setIsBusy(true);
         
         let duration = (targetDistance / Math.abs(speed)) * 1000;
