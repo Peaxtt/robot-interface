@@ -1,0 +1,21 @@
+web_action_bridge:
+  ros__parameters:
+    # --- Ratio (Pulse per Unit) ---
+    ratio_lift: 1000000.0  # Pulse ต่อเมตร
+    ratio_slide: 1000000.0
+    ratio_turn: 2000.0     # Pulse ต่อองศา
+    
+    # --- Speed (RPM or Pulse/sec) ---
+    speed_lift: 300000
+    speed_turn: 200000
+    speed_slide: 300000
+    speed_hook: 600
+    
+    # --- Hook Positions (Moons) ---
+    hook_m4_lock: 25000
+    hook_m4_unlock: 0
+    hook_m5_lock: 0
+    hook_m5_unlock: 25000
+    
+    # --- System ---
+    action_timeout: 30.0
