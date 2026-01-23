@@ -4,8 +4,6 @@ import Sidebar from './components/Layout/Sidebar';
 import OpenLoopControl from './components/MobileBase/OpenLoopControl';
 import ClosedLoopControl from './components/MobileBase/ClosedLoopControl';
 import RobotStatus from './components/MobileBase/RobotStatus'; 
-
-//  1. IMPORT PIGGYBACK COMPONENT
 import PiggybackControl from './components/Piggyback/PiggybackControl';
 
 function App() {
@@ -15,6 +13,13 @@ function App() {
   const [ros, setRos] = useState(null);
   const [rosStatus, setRosStatus] = useState('DISCONNECTED'); 
 
+  // --- Shared State (Memory Bank) ---
+  const [sharedPath, setSharedPath] = useState([]); 
+  const [sharedStep, setSharedStep] = useState(0);
+  
+  const [sharedLift, setSharedLift] = useState(0.0);
+  const [sharedAngle, setSharedAngle] = useState(90);
+
   const rosInstance = useRef(null);
   const reconnectTimer = useRef(null);
   
@@ -22,8 +27,8 @@ function App() {
   const ROS_PORT = '9090';
 
   useEffect(() => {
-    // เลือก URL ตามสถานการณ์ (Sim=localhost / Real=IP)
-    const ROS_URL = 'ws://localhost:9090'; 
+    const ROS_URL = `ws://${ROBOT_IP}:${ROS_PORT}`; 
+    console.log(`Connecting to ROS at: ${ROS_URL}`);
 
     const connectROS = () => {
       if (rosInstance.current) rosInstance.current.close();
@@ -44,6 +49,7 @@ function App() {
         });
 
         newRos.on('error', (error) => {
+          console.log('ROS Error:', error);
           setRosStatus('ERROR');
         });
 
@@ -110,23 +116,47 @@ function App() {
           </div>
         </header>
 
-        <div className="flex-1 p-6 overflow-hidden bg-slate-50/50">
-          {activeTab === 'mobile' ? (
-            <div className="flex flex-col gap-6 h-full">
-              <div className="flex-[2] overflow-hidden">
-                {controlMode === 'MANUAL' 
-                  ? <OpenLoopControl ros={ros} /> 
-                  : <ClosedLoopControl ros={ros} />
-                }
+        <div className="flex-1 p-6 overflow-hidden bg-slate-50/50 relative">
+          
+          {/* --- TAB 1: MOBILE BASE --- */}
+          <div className={`${activeTab === 'mobile' ? 'flex' : 'hidden'} flex-col gap-6 h-full`}>
+              
+              <div className="flex-[2] overflow-hidden relative">
+                
+                {/* ✅ FIX: ใช้ Hidden Mode แทนการ Unmount 
+                   ทำให้ทั้ง Manual และ Auto ทำงานค้างไว้ตลอดเวลา ไม่รีเซ็ตค่า 
+                */}
+
+                {/* 1. MANUAL CONTROL */}
+                <div className={`h-full w-full ${controlMode === 'MANUAL' ? 'block' : 'hidden'}`}>
+                    <OpenLoopControl ros={ros} />
+                </div>
+
+                {/* 2. AUTO MISSION */}
+                <div className={`h-full w-full ${controlMode === 'AUTO' ? 'block' : 'hidden'}`}>
+                    <ClosedLoopControl 
+                        ros={ros} 
+                        savedPath={sharedPath} setSavedPath={setSharedPath}
+                        savedStep={sharedStep} setSavedStep={setSharedStep}
+                    />
+                </div>
+
               </div>
+              
               <div className="h-24 shrink-0">
                 <RobotStatus ros={ros} /> 
               </div>
-            </div>
-          ) : (
-             //  2. เรียกใช้ Component ตรงนี้ (ส่ง props 'ros' ไปด้วย)
-             <PiggybackControl ros={ros} />
-          )}
+          </div>
+
+          {/* --- TAB 2: PIGGYBACK --- */}
+          <div className={`${activeTab === 'piggyback' ? 'block' : 'hidden'} h-full`}>
+             <PiggybackControl 
+                ros={ros}
+                savedLift={sharedLift} setSavedLift={setSharedLift}
+                savedAngle={sharedAngle} setSavedAngle={setSharedAngle}
+             />
+          </div>
+
         </div>
       </main>
     </div>

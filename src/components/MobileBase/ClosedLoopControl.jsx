@@ -5,14 +5,21 @@ import {
   ArrowUp, Square, Route, Flag, Navigation, RotateCw, Lock
 } from 'lucide-react';
 
-const ClosedLoopControl = ({ ros }) => {
+// 1. [แก้] รับ Props เพิ่มเข้ามาตรงนี้
+const ClosedLoopControl = ({ ros, savedPath, setSavedPath, savedStep, setSavedStep }) => {
+  
   // --- Constants & Config ---
   const gridSize = 5;
   const getQrId = (col, row) => (col * 5) + row + 1;
 
   // --- States ---
-  const [selectedPath, setSelectedPath] = useState([]); 
-  const [activeIdx, setActiveIdx] = useState(0); 
+  // 2. [แก้] Alias Props เป็นชื่อเดิม + ใส่ค่ากันตาย (|| [])
+  const selectedPath = savedPath || [];
+  const setSelectedPath = setSavedPath || (() => {});
+  
+  const activeIdx = savedStep || 0;
+  const setActiveIdx = setSavedStep || (() => {});
+
   const [isSending, setIsSending] = useState(false); // Master Busy Flag
   const [alignStatus, setAlignStatus] = useState("READY"); 
   const [isSettingSync, setIsSettingSync] = useState(false);
@@ -26,13 +33,13 @@ const ClosedLoopControl = ({ ros }) => {
   const isStopRequested = useRef(false);
   const pathIdsRef = useRef([]);
 
-  // --- 1. ROS Setup ---
+  // --- ROS Setup ---
   useEffect(() => {
     if (!ros) return;
     
     bridgeTopic.current = new ROSLIB.Topic({ 
       ros: ros, 
-      name: '/web_command_gateway', 
+      name: '/web_bridge/command', // [เช็ค] Topic ตรงกับ Bridge หรือยัง? (ปกติใช้ /web_bridge/command)
       messageType: 'std_msgs/String' 
     });
     
@@ -48,7 +55,7 @@ const ClosedLoopControl = ({ ros }) => {
         const action = data.active_action;
         const feedback = data.feedback_msg;
         
-        // เช็คว่าหุ่นกำลัง Busy หรือไม่ (รวมทุกสถานะ)
+        // เช็คว่าหุ่นกำลัง Busy หรือไม่
         if (action === "MISSION" || action === "DOCKING" || action === "NAVIGATING") {
             setIsSending(true);
             setAlignStatus(feedback);
@@ -57,15 +64,15 @@ const ClosedLoopControl = ({ ros }) => {
             if (feedback && feedback.includes("QR_")) {
                 const parts = feedback.split('_');
                 const targetId = parseInt(parts[parts.length - 1]);
+                // แปลง ID กลับเป็น Index ใน Path ของเรา
+                // หมายเหตุ: pathIdsRef เก็บค่า ID ไว้ตอนกด Run
                 const idx = pathIdsRef.current.indexOf(targetId);
                 if (idx !== -1) setActiveIdx(idx);
             }
         } else {
-            // หุ่นว่างงาน (IDLE)
             setIsSending(false);
             setAlignStatus("READY");
             
-            // ถ้าจบภารกิจแล้ว (และไม่ได้กด Stop เอง) -> เคลียร์สถานะ
             if (!isStopRequested.current && pathIdsRef.current.length > 0 && action === "IDLE") {
                  pathIdsRef.current = [];
             }
@@ -81,7 +88,7 @@ const ClosedLoopControl = ({ ros }) => {
     facingSub.subscribe((msg) => setFacingDir(msg.data));
 
     return () => { statusSub.unsubscribe(); facingSub.unsubscribe(); };
-  }, [ros]);
+  }, [ros]); // เพิ่ม dependencies ที่จำเป็นถ้าต้องการ (แต่ ros ตัวเดียวก็พอไหว)
 
   const getHeadingFromFacing = (dir) => {
     if (dir === '+X' || dir === 'RIGHT') return 0;              
@@ -100,12 +107,14 @@ const ClosedLoopControl = ({ ros }) => {
     const missionIds = selectedPath.map(p => getQrId(p.x, p.y));
     pathIdsRef.current = missionIds;
 
-    // ส่งคำสั่ง Mission (Mode 3: Both)
+    // ส่งคำสั่ง Mission
     const payload = { 
         type: 'EXECUTE_MISSION', 
         path: missionIds,
-        final_heading: finalHeading // ส่งค่ามุม (0, 90, 180, 270) ไปด้วย
+        // final_heading: finalHeading // ตัดออกตามที่คุยกันก่อนหน้า (Bridge ไม่ได้รับค่านี้)
     };
+    
+    // ถ้า Bridge แก้แล้วให้รับ final_heading ได้ ก็ uncomment บรรทัดบน
     
     bridgeTopic.current.publish({ data: JSON.stringify(payload) });
     
@@ -116,14 +125,17 @@ const ClosedLoopControl = ({ ros }) => {
 
   const handleStop = () => { 
     isStopRequested.current = true; 
-    setIsSending(false); // ปลดล็อคทันที
+    setIsSending(false);
     pathIdsRef.current = [];
     setActiveIdx(0);
-    bridgeTopic.current.publish({ data: JSON.stringify({ stop: true }) }); 
+    
+    // ส่ง Stop
+    if (bridgeTopic.current) {
+        bridgeTopic.current.publish({ data: JSON.stringify({ type: 'STOP' }) }); 
+    }
   };
 
   const handleGridClick = (col, row) => {
-    // 🔒 LOCK: ห้ามกด Map ตอนรัน
     if (isSending) return; 
     
     if (isSettingSync) { setCurrentGrid({ x: col, y: row }); setIsSettingSync(false); return; }
@@ -186,7 +198,6 @@ const ClosedLoopControl = ({ ros }) => {
     <div className="bg-white p-4 lg:p-6 rounded-2xl border border-slate-200 shadow-sm h-full flex gap-6 select-none overflow-hidden">
       <style>{`
         @keyframes dashflow { from { stroke-dashoffset: 20; } to { stroke-dashoffset: 0; } }
-        /* ✅ เส้นไหลๆ */
         .flowing-path { stroke-dasharray: 12, 8; animation: dashflow 1s linear infinite; will-change: stroke-dashoffset; }
       `}</style>
 
@@ -203,7 +214,6 @@ const ClosedLoopControl = ({ ros }) => {
                 <p className="text-[10px] text-slate-400 ml-10 font-bold uppercase tracking-wider">Bridge System Active</p>
             </div>
             
-            {/* 🔒 LOCK: ปุ่ม Set Start */}
             <button 
                 disabled={isSending}
                 onClick={() => setIsSettingSync(!isSettingSync)} 
@@ -215,12 +225,11 @@ const ClosedLoopControl = ({ ros }) => {
             </button>
         </div>
 
-        {/* 🔒 LOCK: ตัว Map Container */}
+        {/* MAP CONTAINER */}
         <div className={`flex-1 bg-slate-50/50 rounded-3xl border border-slate-100 flex items-center justify-center p-4 relative overflow-hidden shadow-inner transition-all min-h-0 ${isSending ? 'brightness-95 pointer-events-none' : ''}`}>
             
             <div className="relative h-full w-auto aspect-[0.66] max-w-full">
                 
-                {/* SVG Path */}
                 <svg className="absolute inset-0 pointer-events-none w-full h-full z-20" viewBox="0 0 100 100" preserveAspectRatio="none" style={{ overflow: 'visible' }}>
                    {selectedPath.length > 0 && (
                      <polyline points={[currentGrid, ...selectedPath].map(p => `${p.x * 20 + 10} ${100 - (p.y * 20 + 10)}`).join(' ')}
@@ -233,11 +242,9 @@ const ClosedLoopControl = ({ ros }) => {
                    )}
                 </svg>
 
-                {/* GRID Grid */}
                 <div className="grid grid-cols-5 gap-3 relative h-full">{renderGrid()}</div>
             </div>
             
-            {/* Overlay Lock Message */}
             {isSending && (
                <div className="absolute top-4 right-4 bg-orange-100 text-orange-600 px-3 py-1 rounded-full text-[10px] font-bold flex items-center gap-2 border border-orange-200 shadow-sm animate-pulse z-50">
                   <Lock size={12}/> CONTROLS LOCKED
@@ -262,7 +269,6 @@ const ClosedLoopControl = ({ ros }) => {
 
       {/* RIGHT: CONTROLS */}
       <div className="w-80 flex flex-col gap-4 shrink-0">
-        {/* 🔒 LOCK: List รายการ */}
         <div className={`flex-1 bg-slate-50 rounded-2xl border border-slate-200 p-4 flex flex-col shadow-inner overflow-hidden transition-all ${isSending ? 'opacity-60 grayscale pointer-events-none' : ''}`}>
             <div className="flex items-center justify-between mb-4 pb-3 border-b border-slate-200 shrink-0">
                 <div className="flex items-center gap-2 text-slate-600 font-bold uppercase tracking-widest text-[10px]"><Route size={16}/> Sequence list</div>
@@ -289,20 +295,17 @@ const ClosedLoopControl = ({ ros }) => {
         
         <div className="flex flex-col gap-2 shrink-0">
             <div className="grid grid-cols-2 gap-2">
-                {/* 🔒 LOCK: ปุ่ม Clear */}
                 <button 
                     disabled={isSending}
                     onClick={() => {setSelectedPath([]); setActiveIdx(0);}} 
                     className={`bg-white border-2 border-slate-200 text-slate-400 py-3 rounded-xl font-bold flex flex-col items-center gap-1 hover:text-red-500 transition-all shadow-sm ${isSending ? 'opacity-30 cursor-not-allowed' : ''}`}>
                     <Trash size={18}/><span className="text-[9px]">CLEAR</span>
                 </button>
-                {/* ปุ่ม Stop ไม่ล็อค */}
                 <button onClick={handleStop} className="bg-white border-2 border-red-100 text-red-500 py-3 rounded-xl font-bold flex flex-col items-center gap-1 hover:bg-red-600 hover:text-white transition-all shadow-sm">
                     <Square size={18} fill="currentColor"/><span className="text-[9px]">STOP</span>
                 </button>
             </div>
             
-            {/* 🔒 LOCK: ปุ่ม Run */}
             <button onClick={handleRun} disabled={selectedPath.length === 0 || isSending} 
                 className={`py-4 rounded-xl font-bold flex items-center justify-center gap-3 shadow-lg text-white transition-all uppercase text-xs tracking-widest 
                 ${selectedPath.length === 0 ? 'bg-slate-300' : isSending ? 'bg-orange-500 ring-4 ring-orange-100 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-700'}`}>

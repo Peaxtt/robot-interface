@@ -1,26 +1,31 @@
 #!/usr/bin/env python3
 import os
-from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch_ros.actions import Node
 
 def generate_launch_description():
-    # 1. ระบุตำแหน่ง Config ที่เราสร้างไว้
-    pkg_description = get_package_share_directory('facobot_description')
-    bridge_config = os.path.join(pkg_description, 'config', 'web_action_params.yaml')
+    # 1. หาตำแหน่งโฟลเดอร์ปัจจุบันของไฟล์นี้ (launch)
+    current_dir = os.path.dirname(os.path.realpath(__file__))
+    
+    # 2. ถอยหลัง 1 ขั้น เพื่อไปที่ root ของ 'robot-interface'
+    project_root = os.path.dirname(current_dir)
+
+    # 3. ระบุตำแหน่งไฟล์ Bridge และ Config แบบ Relative
+    script_path = os.path.join(project_root, 'bridge', 'action_bridge.py')
+    
+    # หมายเหตุ: ถ้า Config ยังอยู่ที่ facobot_description ให้แก้ path ตรงนี้เป็น path เต็มแทน
+    # แต่ถ้าคุณย้าย config มาไว้ใน robot-interface/config/ แล้ว ก็ใช้บรรทัดล่างนี้ได้เลย
+    # config_path = os.path.join(project_root, 'config', 'web_action_params.yaml')
+    
+    # (Fallback) ถ้า Config อยู่ที่ facobot_description
+    config_path = '/home/admin/facobot_ws/src/facobot_description/config/web_action_params.yaml'
 
     return LaunchDescription([
-        # =========================================================
-        # เราเปิดแค่ Action Bridge เท่านั้น!
-        # เพราะ:
-        # - Driver/Lidar/Odom -> เปิดโดย system_bringup แล้ว
-        # - Rosbridge (WebSocket) -> เปิดโดย system_bringup แล้ว
-        # =========================================================
         Node(
-            package='facobot_description',
-            executable='action_bridge.py',
+            package=None, # ไม่ใช้ Package
+            executable=script_path, # รันไฟล์นี้ตรงๆ
             name='web_action_bridge',
             output='screen',
-            parameters=[bridge_config] # โหลดค่า Config (Ratio/Speed)
+            parameters=[config_path]
         )
     ])

@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import * as ROSLIB from 'roslib'; 
 import { 
-  Activity, Battery, Wifi, Navigation, AlertTriangle, CheckCircle2, Scan, Zap
+  Activity, Battery, Wifi, Navigation, AlertTriangle, CheckCircle2, Scan, Zap, Crosshair
 } from 'lucide-react';
 
 const RobotStatus = ({ ros }) => {
@@ -14,12 +14,24 @@ const RobotStatus = ({ ros }) => {
   const [errorText, setErrorText] = useState("SYSTEM NOMINAL"); 
   const [isConnected, setIsConnected] = useState(false);
   
-  // Vision State
-  const [qrInfo, setQrInfo] = useState({ visible: false, id: -1, cx: 0, cy: 0, ang: 0 });
-  const qrTimeoutRef = useRef(null);
+  // Vision & Localization State (NEW ✨)
+  const [qrRaw, setQrRaw] = useState({ visible: false, id: -1 }); // จากกล้องดิบๆ
+  const [confirmedQrId, setConfirmedQrId] = useState(null);       // จาก /qr_id (ที่ระบบยอมรับ)
+  const [qrOdom, setQrOdom] = useState({ x: 0, y: 0, th: 0 });    // จาก /odom_qr
+  
   const watchdogRef = useRef(null);
+  const qrTimeoutRef = useRef(null);
 
   // --- HELPER FUNCTIONS ---
+  // แปลง Quaternion เป็น Euler (Yaw)
+  const getYawFromQuat = (q) => {
+    if (!q) return 0;
+    const { x, y, z, w } = q;
+    const siny_cosp = 2 * (w * z + x * y);
+    const cosy_cosp = 1 - 2 * (y * y + z * z);
+    return Math.atan2(siny_cosp, cosy_cosp);
+  };
+
   const decodeFF = (ff) => {
     if (ff === 0) return null;
     if (ff & 1) return "OVERHEAT";
@@ -41,30 +53,23 @@ const RobotStatus = ({ ros }) => {
   useEffect(() => {
     if (!ros) { setIsConnected(false); return; }
 
-    // 1. BRIDGE STATUS (Heartbeat 10Hz)
-    // รับข้อมูลรวมศูนย์: Odom, Battery, Hardware Errors
+    // 1. BRIDGE STATUS (Heartbeat)
     const bridgeSub = new ROSLIB.Topic({ 
-        ros: ros, 
-        name: '/web_full_status', 
-        messageType: 'std_msgs/String' 
+        ros: ros, name: '/web_full_status', messageType: 'std_msgs/String' 
     });
 
     bridgeSub.subscribe((msg) => {
         try {
             const data = JSON.parse(msg.data);
             setIsConnected(true);
-            
-            // Watchdog: ถ้าไม่ได้ update นานๆ ให้ขึ้น Offline
             if(watchdogRef.current) clearTimeout(watchdogRef.current);
             watchdogRef.current = setTimeout(() => setIsConnected(false), 2000);
 
-            // Update States
             setOdom(data.position);
             setFlags(data.hardware);
             setBattery(data.battery);
             setVoltage(data.voltage || 24.0);
 
-            // Check Errors
             const ffText = decodeFF(data.hardware.ff);
             const fm1Text = data.hardware.fm1 !== 0 ? `M1:${decodeFM(data.hardware.fm1)}` : "";
             const fm2Text = data.hardware.fm2 !== 0 ? `M2:${decodeFM(data.hardware.fm2)}` : "";
@@ -76,55 +81,63 @@ const RobotStatus = ({ ros }) => {
                 setIsEmergency(false);
                 setErrorText(data.active_action !== 'IDLE' ? data.active_action : "SYSTEM NOMINAL");
             }
-
-        } catch (e) { console.error("Status Parse Error", e); }
+        } catch (e) { console.error("Status Error", e); }
     });
 
-    // 2. VISION RAW DATA (Optional)
-    // เพื่อโชว์ว่ากล้องเห็น QR หรือไม่ (Direct Feedback)
-    const qrSub = new ROSLIB.Topic({ 
-        ros: ros, 
-        name: '/lector_floor_node/raw_data', 
-        messageType: 'std_msgs/String' 
+    // 2. [NEW] CONFIRMED QR ID (/qr_id)
+    const qrIdSub = new ROSLIB.Topic({
+        ros: ros, name: '/qr_id', messageType: 'std_msgs/Int32'
+    });
+    qrIdSub.subscribe((msg) => {
+        setConfirmedQrId(msg.data);
     });
 
-    qrSub.subscribe((msg) => {
-        // Format: "ID:1,cx:0.02,cy:-0.01,ang:0.5"
+    // 3. [NEW] QR ODOMETRY (/odom_qr)
+    const qrOdomSub = new ROSLIB.Topic({
+        ros: ros, name: '/odom_qr', messageType: 'nav_msgs/Odometry'
+    });
+    qrOdomSub.subscribe((msg) => {
+        const p = msg.pose.pose.position;
+        const q = msg.pose.pose.orientation;
+        setQrOdom({
+            x: p.x,
+            y: p.y,
+            th: getYawFromQuat(q)
+        });
+    });
+
+    // 4. RAW VISION DATA (Lector Raw) - เอาไว้ดูว่ากล้องเห็นอะไรแวบๆ ไหม
+    const qrRawSub = new ROSLIB.Topic({ 
+        ros: ros, name: '/lector_floor_node/raw_data', messageType: 'std_msgs/String' 
+    });
+
+    qrRawSub.subscribe((msg) => {
         const txt = msg.data;
         if (txt.includes("ID:")) {
             const idMatch = txt.match(/ID:(-?\d+)/);
-            const cxMatch = txt.match(/cx:([-\d.]+)/);
-            const cyMatch = txt.match(/cy:([-\d.]+)/); // cy คือระยะห่างใน Sim
-            const angMatch = txt.match(/ang:([-\d.]+)/);
-
             if (idMatch) {
-                setQrInfo({
-                    visible: true,
-                    id: idMatch[1],
-                    cx: cxMatch ? parseFloat(cxMatch[1]).toFixed(3) : 0,
-                    cy: cyMatch ? parseFloat(cyMatch[1]).toFixed(3) : 0,
-                    ang: angMatch ? parseFloat(angMatch[1]).toFixed(1) : 0
-                });
-
+                setQrRaw({ visible: true, id: idMatch[1] });
                 if (qrTimeoutRef.current) clearTimeout(qrTimeoutRef.current);
-                qrTimeoutRef.current = setTimeout(() => setQrInfo(prev => ({ ...prev, visible: false })), 500);
+                qrTimeoutRef.current = setTimeout(() => setQrRaw({ visible: false, id: -1 }), 500);
             }
         }
     });
 
     return () => { 
         bridgeSub.unsubscribe(); 
-        qrSub.unsubscribe(); 
+        qrIdSub.unsubscribe();
+        qrOdomSub.unsubscribe();
+        qrRawSub.unsubscribe();
         if(watchdogRef.current) clearTimeout(watchdogRef.current);
     };
   }, [ros]);
 
   // --- RENDER ---
   return (
-    <div className="h-full bg-white border border-slate-200 rounded-xl shadow-sm flex items-center px-2 py-1 gap-2 overflow-hidden">
+    <div className="h-full bg-white border border-slate-200 rounded-xl shadow-sm flex items-center px-2 py-1 gap-2 overflow-hidden select-none">
       
-      {/* 1. MAIN STATUS BADGE */}
-      <div className={`w-64 shrink-0 flex items-center gap-3 p-2 rounded-lg border-l-4 transition-all ${!isConnected ? 'bg-slate-100 border-slate-400' : isEmergency ? 'bg-red-50 border-red-500' : 'bg-slate-800 border-green-500'}`}>
+      {/* 1. SYSTEM STATUS */}
+      <div className={`w-56 shrink-0 flex items-center gap-3 p-2 rounded-lg border-l-4 transition-all ${!isConnected ? 'bg-slate-100 border-slate-400' : isEmergency ? 'bg-red-50 border-red-500' : 'bg-slate-800 border-green-500'}`}>
          <div className={`p-2 rounded-full ${isEmergency ? 'bg-red-100 text-red-600 animate-pulse' : 'bg-white/10 text-green-400'}`}>
             {!isConnected ? <Wifi size={20} className="text-slate-400"/> : isEmergency ? <AlertTriangle size={20}/> : <CheckCircle2 size={20}/>}
          </div>
@@ -136,49 +149,50 @@ const RobotStatus = ({ ros }) => {
          </div>
       </div>
 
-      <div className="w-px h-12 bg-slate-100 mx-2"></div>
+      <div className="w-px h-12 bg-slate-100 mx-1"></div>
 
-     {/* 2. ODOMETRY - ปรับช่องไฟใหม่ให้ดูเป็นระเบียบ */}
-      <div className="flex-1 flex justify-center items-center gap-8">
+     {/* 2. ODOMETRY (MAIN) */}
+      <div className="flex-1 flex justify-center items-center gap-6">
           <div className="flex items-center gap-3">
               <div className="p-2 bg-blue-50 text-blue-600 rounded-lg shadow-sm">
                 <Navigation size={18}/>
               </div>
               <div className="flex flex-col">
-                  <span className="text-[9px] font-bold text-slate-400 tracking-wider">POSITION (m)</span>
-                  <div className="flex gap-4 font-mono text-sm font-bold text-slate-700">
-                      <div className="flex gap-1"><span className="text-slate-400">X:</span>{odom.x.toFixed(2)}</div>
-                      <div className="flex gap-1"><span className="text-slate-400">Y:</span>{odom.y.toFixed(2)}</div>
+                  <span className="text-[9px] font-bold text-slate-400 tracking-wider">ROBOT POSE</span>
+                  <div className="flex gap-3 font-mono text-sm font-bold text-slate-700">
+                      <div><span className="text-slate-400 text-[10px] mr-1">X</span>{odom.x.toFixed(2)}</div>
+                      <div><span className="text-slate-400 text-[10px] mr-1">Y</span>{odom.y.toFixed(2)}</div>
+                      <div className="text-blue-600"><span className="text-slate-400 text-[10px] mr-1">H</span>{((90 - odom.th + 360) % 360).toFixed(0)}°</div>
                   </div>
               </div>
           </div>
-
-          {/* แยกส่วนองศาออกมาให้เด่นขึ้น */}
-          <div className="flex flex-col border-l border-slate-100 pl-6">
-              <span className="text-[9px] font-bold text-slate-400 tracking-wider">HEADING</span>
-              <span className="text-base font-black text-blue-600 font-mono leading-none mt-1">
-                  {/* ✅ สูตรแปลง: ขึ้น = 0° (UI Standard) */}
-                  { ((90 - odom.th + 360) % 360).toFixed(1) }°
-              </span>
+          
+          {/* QR CODE & ODOM_QR (แสดงคู่กันเพื่อเทียบค่า) */}
+          <div className="flex items-center gap-3 pl-6 border-l border-slate-100">
+              <div className={`p-2 rounded-lg transition-colors ${confirmedQrId !== null ? 'bg-purple-100 text-purple-600' : 'bg-slate-50 text-slate-300'}`}>
+                <Scan size={18}/>
+              </div>
+              <div className="flex flex-col">
+                  <div className="flex items-center gap-2">
+                     <span className="text-[9px] font-bold text-slate-400 tracking-wider">QR LOCALIZATION</span>
+                     {qrRaw.visible && <span className="flex h-1.5 w-1.5 rounded-full bg-green-500 animate-pulse"/>}
+                  </div>
+                  <div className="flex items-center gap-3">
+                      {/* ID ที่อ่านได้ */}
+                      <div className={`text-xs font-black px-1.5 py-0.5 rounded ${confirmedQrId!==null ? 'bg-purple-600 text-white' : 'bg-slate-200 text-slate-400'}`}>
+                          {confirmedQrId !== null ? `Q${confirmedQrId}` : "NO REF"}
+                      </div>
+                      {/* พิกัดที่อ่านได้จาก QR */}
+                      <div className="flex gap-2 font-mono text-[10px] font-bold text-slate-500">
+                           <span>x:{qrOdom.x.toFixed(2)}</span>
+                           <span>y:{qrOdom.y.toFixed(2)}</span>
+                      </div>
+                  </div>
+              </div>
           </div>
       </div>
 
-      <div className="w-px h-12 bg-slate-100 mx-2"></div>
-
-      {/* 3. QR VISION STATUS */}
-      <div className={`w-48 shrink-0 flex items-center gap-3 p-2 rounded-lg border transition-all ${qrInfo.visible ? 'bg-blue-50 border-blue-200' : 'bg-slate-50 border-transparent'}`}>
-          <div className={`p-1.5 rounded-md ${qrInfo.visible ? 'bg-blue-100 text-blue-600' : 'bg-slate-200 text-slate-400'}`}>
-              <Scan size={18} className={qrInfo.visible ? 'animate-pulse' : ''}/>
-          </div>
-          <div className="flex flex-col">
-              <span className="text-[9px] font-bold text-slate-400">VISION LINK</span>
-              <span className={`text-xs font-bold font-mono ${qrInfo.visible ? 'text-blue-700' : 'text-slate-400'}`}>
-                  {qrInfo.visible ? `ID:${qrInfo.id} [${qrInfo.cx}, ${qrInfo.cy}]` : "SEARCHING..."}
-              </span>
-          </div>
-      </div>
-
-      <div className="w-px h-12 bg-slate-100 mx-2"></div>
+      <div className="w-px h-12 bg-slate-100 mx-1"></div>
 
       {/* 4. MOTORS & BATTERY */}
       <div className="flex items-center gap-4 pr-4">
