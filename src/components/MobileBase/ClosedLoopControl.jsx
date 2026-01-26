@@ -5,7 +5,6 @@ import {
   ArrowUp, Square, Route, Flag, Navigation, RotateCw, Lock
 } from 'lucide-react';
 
-// 1. [แก้] รับ Props เพิ่มเข้ามาตรงนี้
 const ClosedLoopControl = ({ ros, savedPath, setSavedPath, savedStep, setSavedStep }) => {
   
   // --- Constants & Config ---
@@ -13,7 +12,6 @@ const ClosedLoopControl = ({ ros, savedPath, setSavedPath, savedStep, setSavedSt
   const getQrId = (col, row) => (col * 5) + row + 1;
 
   // --- States ---
-  // 2. [แก้] Alias Props เป็นชื่อเดิม + ใส่ค่ากันตาย (|| [])
   const selectedPath = savedPath || [];
   const setSelectedPath = setSavedPath || (() => {});
   
@@ -32,14 +30,16 @@ const ClosedLoopControl = ({ ros, savedPath, setSavedPath, savedStep, setSavedSt
   const bridgeTopic = useRef(null);
   const isStopRequested = useRef(false);
   const pathIdsRef = useRef([]);
+  const runStartTime = useRef(0); // ✅ เพิ่ม: จำเวลาที่เริ่มกด Run
 
   // --- ROS Setup ---
   useEffect(() => {
     if (!ros) return;
     
+    // ✅ แก้ Topic ให้ตรงกับ Piggyback เพื่อความชัวร์ (/web_command_gateway)
     bridgeTopic.current = new ROSLIB.Topic({ 
       ros: ros, 
-      name: '/web_bridge/command', // [เช็ค] Topic ตรงกับ Bridge หรือยัง? (ปกติใช้ /web_bridge/command)
+      name: '/web_command_gateway', 
       messageType: 'std_msgs/String' 
     });
     
@@ -52,32 +52,58 @@ const ClosedLoopControl = ({ ros, savedPath, setSavedPath, savedStep, setSavedSt
     statusSub.subscribe((msg) => {
       try {
         const data = JSON.parse(msg.data);
-        const action = data.active_action;
-        const feedback = data.feedback_msg;
+        const action = data.active_action || "IDLE"; // กันเหนียวถ้าไม่มี field
+        const feedback = data.feedback_msg || "";
         
-        // เช็คว่าหุ่นกำลัง Busy หรือไม่
-        if (action === "MISSION" || action === "DOCKING" || action === "NAVIGATING") {
+        // Logic การเช็ค Busy
+        // ถ้า action ไม่ใช่ IDLE -> ถือว่าทำงาน
+        const isRobotBusy = action !== "IDLE";
+        
+        // ✅ เพิ่ม Grace Period 2 วินาที: ถ้าเพิ่งกด Run ไปไม่ถึง 2 วิ ให้ถือว่า Busy ไว้ก่อน (รอ Bridge ตื่น)
+        const isGracePeriod = (Date.now() - runStartTime.current) < 2000;
+
+        if (isRobotBusy || isGracePeriod) {
             setIsSending(true);
-            setAlignStatus(feedback);
+            setAlignStatus(feedback || action); // Show status text
             
             // Auto Update Progress Point
+            // สมมติ Feedback ส่งมาเป็น "NAVIGATING TO QR_5"
             if (feedback && feedback.includes("QR_")) {
                 const parts = feedback.split('_');
-                const targetId = parseInt(parts[parts.length - 1]);
-                // แปลง ID กลับเป็น Index ใน Path ของเรา
-                // หมายเหตุ: pathIdsRef เก็บค่า ID ไว้ตอนกด Run
-                const idx = pathIdsRef.current.indexOf(targetId);
-                if (idx !== -1) setActiveIdx(idx);
+                // ลองหาตัวเลขจากส่วนท้าย
+                const targetIdStr = parts.find(p => !isNaN(parseInt(p)));
+                if (targetIdStr) {
+                    const targetId = parseInt(targetIdStr);
+                    const idx = pathIdsRef.current.indexOf(targetId);
+                    if (idx !== -1) setActiveIdx(idx);
+                }
             }
         } else {
-            setIsSending(false);
-            setAlignStatus("READY");
-            
-            if (!isStopRequested.current && pathIdsRef.current.length > 0 && action === "IDLE") {
-                 pathIdsRef.current = [];
+            // ถ้าไม่ Busy และพ้นช่วง Grace Period แล้ว -> จบงาน
+            if (isSending) {
+                setIsSending(false);
+                setAlignStatus("READY");
+                
+                // ถ้าจบแบบไม่ได้กด Stop -> เคลียร์ path หรือจะค้างไว้ก็ได้ตามดีไซน์
+                if (!isStopRequested.current && pathIdsRef.current.length > 0) {
+                     // pathIdsRef.current = []; // Comment ออกถ้าอยากให้เห็นผลลัพธ์ค้างไว้
+                     setAlignStatus("MISSION COMPLETED");
+                }
             }
         }
-      } catch (e) {}
+        
+        // อัปเดตตำแหน่งหุ่นยนต์เรียลไทม์ (ถ้ามี field qr_id)
+        if (data.qr_id && data.qr_id !== "WAIT") {
+             const qrId = parseInt(data.qr_id);
+             // แปลง QR ID กลับเป็น Grid X, Y (สูตร: id = col*5 + row + 1)
+             // row = (id - 1) % 5
+             // col = floor((id - 1) / 5)
+             const r = (qrId - 1) % 5;
+             const c = Math.floor((qrId - 1) / 5);
+             setCurrentGrid({ x: c, y: r });
+        }
+
+      } catch (e) { console.error(e); }
     });
 
     const facingSub = new ROSLIB.Topic({ 
@@ -88,7 +114,7 @@ const ClosedLoopControl = ({ ros, savedPath, setSavedPath, savedStep, setSavedSt
     facingSub.subscribe((msg) => setFacingDir(msg.data));
 
     return () => { statusSub.unsubscribe(); facingSub.unsubscribe(); };
-  }, [ros]); // เพิ่ม dependencies ที่จำเป็นถ้าต้องการ (แต่ ros ตัวเดียวก็พอไหว)
+  }, [ros, isSending]); // เพิ่ม isSending ใน dep เพื่อให้ state ไม่อมค่าเก่า
 
   const getHeadingFromFacing = (dir) => {
     if (dir === '+X' || dir === 'RIGHT') return 0;              
@@ -101,8 +127,11 @@ const ClosedLoopControl = ({ ros, savedPath, setSavedPath, savedStep, setSavedSt
   // --- Handlers ---
   const handleRun = () => { 
     if (selectedPath.length === 0 || isSending) return; 
+    
     isStopRequested.current = false; 
     setIsSending(true); 
+    runStartTime.current = Date.now(); // ✅ เริ่มจับเวลา Grace Period
+    setAlignStatus("STARTING...");
     
     const missionIds = selectedPath.map(p => getQrId(p.x, p.y));
     pathIdsRef.current = missionIds;
@@ -110,13 +139,12 @@ const ClosedLoopControl = ({ ros, savedPath, setSavedPath, savedStep, setSavedSt
     // ส่งคำสั่ง Mission
     const payload = { 
         type: 'EXECUTE_MISSION', 
-        path: missionIds,
-        // final_heading: finalHeading // ตัดออกตามที่คุยกันก่อนหน้า (Bridge ไม่ได้รับค่านี้)
+        path: missionIds
     };
     
-    // ถ้า Bridge แก้แล้วให้รับ final_heading ได้ ก็ uncomment บรรทัดบน
-    
-    bridgeTopic.current.publish({ data: JSON.stringify(payload) });
+    if (bridgeTopic.current) {
+        bridgeTopic.current.publish({ data: JSON.stringify(payload) });
+    }
     
     setActiveIdx(0);
     const initialH = getHeadingFromFacing(facingDir);
@@ -128,10 +156,12 @@ const ClosedLoopControl = ({ ros, savedPath, setSavedPath, savedStep, setSavedSt
     setIsSending(false);
     pathIdsRef.current = [];
     setActiveIdx(0);
+    setAlignStatus("STOPPED");
     
     // ส่ง Stop
     if (bridgeTopic.current) {
-        bridgeTopic.current.publish({ data: JSON.stringify({ type: 'STOP' }) }); 
+        // ส่ง Format เดียวกับ Piggyback เพื่อความชัวร์
+        bridgeTopic.current.publish({ data: JSON.stringify({ stop: true }) }); 
     }
   };
 
