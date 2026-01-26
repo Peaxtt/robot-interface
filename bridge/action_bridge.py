@@ -36,7 +36,7 @@ class ActionBridge(Node):
         self.LIFT_POSITIONS = {
             0: 103000, 1: 365000, 2: 628000, 3: 890000
         }
-        self.SPD_LIFT = 600000
+        self.SPD_LIFT = 600000 # Pulse per minute
 
         # Turntable: Right, Left, Back (Index 0-2)
         self.TURN_POSITIONS = {
