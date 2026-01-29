@@ -3,12 +3,11 @@ import * as ROSLIB from 'roslib';
 import { 
   MoveVertical, RotateCw, Settings, 
   ChevronLeft, ChevronRight, ArrowDown, 
-  Lock, Unlock, RefreshCw, Target, ChevronsLeft, ChevronsRight, Octagon, Activity
+  Lock, Unlock, RefreshCw, Target, ChevronsLeft, ChevronsRight, Octagon, Activity, AlertTriangle
 } from 'lucide-react';
 
 const PiggybackControl = ({ ros, savedLift, setSavedLift, savedAngle, setSavedAngle }) => {
   // --- CONFIG ---
-  // Level Map: L1=0.16, L4=1.42
   const LEVEL_MAP = [0.16, 0.58, 1.00, 1.42]; 
   const MAX_HEIGHT = 1.5; 
   const MAX_SLIDE = 0.5;
@@ -17,7 +16,15 @@ const PiggybackControl = ({ ros, savedLift, setSavedLift, savedAngle, setSavedAn
   // Pulse Constants
   const PULSE_PER_METER = 625000.0;
   const PULSE_TURN_90 = 166300.0;
+  const PULSE_TURN_180 = 330300.0;
   const PULSE_SLIDE_MAX = 235000.0;
+
+  // Thresholds
+  const THRESHOLD = {
+      LIFT: 0.03, // 3 cm
+      TURN: 3.0,  // 3 degrees
+      SLIDE: 0.03 // 3 cm
+  };
 
   const COMPONENT = { LIFT: 0, TURNTABLE: 1, INSERT: 2, HOOK: 3 };
 
@@ -25,40 +32,45 @@ const PiggybackControl = ({ ros, savedLift, setSavedLift, savedAngle, setSavedAn
   const [status, setStatus] = useState("READY");
   const [isBusy, setIsBusy] = useState(false);
   const [isError, setIsError] = useState(false);
+  const [alertMsg, setAlertMsg] = useState(null);
 
-  // Busy State (Lock per axis)
-  const [busyState, setBusyState] = useState({
-      lift: false, turn: false, slide: false, hook: false
-  });
+  // Target State
+  const [lastTarget, setLastTarget] = useState({ lift: null, turn: null, slide: null });
 
-  // Lift State
+  // Busy State
+  const [busyState, setBusyState] = useState({ lift: false, turn: false, slide: false, hook: false });
+
+  // Real-time Values
   const liftHeight = savedLift || 0.0;
   const setLiftHeight = setSavedLift || (() => {});   
   const [targetLift, setTargetLift] = useState(liftHeight);    
   const [tempLift, setTempLift] = useState(0.0);        
 
-  // Turn State
   const turntableAngle = savedAngle || 0; 
   const setTurntableAngle = setSavedAngle || (() => {}); 
   const [activeDir, setActiveDir] = useState('RIGHT'); 
   const [tempAngle, setTempAngle] = useState(0);
 
-  // Tools State
   const [slideDist, setSlideDist] = useState(0.0);
   const [targetSlide, setTargetSlide] = useState(0.0); 
   const [tempSlide, setTempSlide] = useState(0.0);     
   const [isHookLocked, setIsHookLocked] = useState(false);
 
-  // Refs
   const bridgeTopic = useRef(null);
   const timeoutRef = useRef(null);
-  const lastCmdTime = useRef(0); // Store last command time for grace period
+  const alertTimeoutRef = useRef(null);
 
-  // Helper: UInt32 -> Int32
+  // Helper
   const parsePulse = (val) => {
       if (val === undefined || val === null) return 0;
       if (val > 2147483647) return val - 4294967296;
       return val;
+  };
+
+  const showAlert = (msg) => {
+      setAlertMsg(msg);
+      if (alertTimeoutRef.current) clearTimeout(alertTimeoutRef.current);
+      alertTimeoutRef.current = setTimeout(() => setAlertMsg(null), 1500);
   };
 
   // --- ROS SETUP ---
@@ -78,62 +90,65 @@ const PiggybackControl = ({ ros, savedLift, setSavedLift, savedAngle, setSavedAn
             const action = data.active_action || "IDLE";
             const feedback = (data.feedback_msg || "").toUpperCase();
 
-            // --- 1. BUSY LOGIC (WITH GRACE PERIOD) ---
-            const isSystemBusy = action !== "IDLE";
-            const timeSinceCmd = Date.now() - lastCmdTime.current;
-            const GRACE_PERIOD = 1500; // 1.5 seconds minimum lock time
+            // 1. UPDATE REAL-TIME VALUES
+            let currentLift = liftHeight;
+            let currentTurn = turntableAngle;
+            let currentSlide = slideDist;
 
-            if (isSystemBusy) {
-                // If backend reports BUSY -> Lock immediately
-                if (!isError) {
-                    setIsBusy(true);
-                    setStatus(feedback || `BUSY: ${action}`);
-                }
-                // Update specific axis locks
-                setBusyState({
-                    lift: action.includes("LIFT") || feedback.includes("LIFT"),
-                    turn: action.includes("TURN") || feedback.includes("TURN"),
-                    slide: action.includes("SLIDE") || feedback.includes("SLIDE"),
-                    hook: action.includes("HOOK") || action.includes("GRIPPER")
-                });
-                clearTimeoutHandler(); 
-            } else {
-                // If backend reports IDLE
-                if (timeSinceCmd < GRACE_PERIOD) {
-                    // Force BUSY if within grace period
-                    setIsBusy(true);
-                } else {
-                    // Actually IDLE -> Unlock
-                    clearTimeoutHandler();
-                    setIsBusy(false);
-                    setIsError(false);
-                    setStatus("READY");
-                    setBusyState({ lift: false, turn: false, slide: false, hook: false });
-                }
-            }
-
-            // --- 2. REAL-TIME FEEDBACK ---
             if (data.piggyback) {
                 // Lift
-                const rawLift = parsePulse(data.piggyback.lift_pos);
-                setLiftHeight(rawLift / PULSE_PER_METER);
+                currentLift = parsePulse(data.piggyback.lift_pos) / PULSE_PER_METER;
+                setLiftHeight(currentLift);
 
                 // Slide
                 const rawSlide = parsePulse(data.piggyback.slide_pos);
-                setSlideDist((rawSlide / PULSE_SLIDE_MAX) * MAX_SLIDE);
+                currentSlide = (rawSlide / PULSE_SLIDE_MAX) * MAX_SLIDE;
+                setSlideDist(currentSlide);
 
-                // Turn (0 Pulse = 0 Deg)
+                // Turn
                 const rawTurn = parsePulse(data.piggyback.turn_pos);
                 let realAngle = 0;
-                // Formula: (Pulse / 166300) * 90
-                realAngle = (rawTurn / 166300.0) * 90.0;
-                // Clamp 0-180
-                realAngle = Math.max(0, Math.min(180, realAngle));
-                
-                setTurntableAngle(realAngle);
+                if (rawTurn <= 0) realAngle = 0;
+                else if (rawTurn <= PULSE_TURN_90) realAngle = (rawTurn / PULSE_TURN_90) * 90.0;
+                else {
+                    const rangeSpan = PULSE_TURN_180 - PULSE_TURN_90;
+                    realAngle = 90.0 + ((rawTurn - PULSE_TURN_90) / rangeSpan) * 90.0;
+                }
+                currentTurn = Math.max(0, Math.min(180, realAngle));
+                setTurntableAngle(currentTurn);
 
                 // Hook
                 setIsHookLocked(parsePulse(data.piggyback.hook_4) > 5000); 
+            }
+
+            // 2. CHECK TARGET REACHED
+            const backendBusy = action !== "IDLE";
+            let isLiftMoving = false, isTurnMoving = false, isSlideMoving = false;
+
+            if (lastTarget.lift !== null) isLiftMoving = Math.abs(currentLift - lastTarget.lift) > THRESHOLD.LIFT;
+            if (lastTarget.turn !== null) isTurnMoving = Math.abs(currentTurn - lastTarget.turn) > THRESHOLD.TURN;
+            if (lastTarget.slide !== null) isSlideMoving = Math.abs(currentSlide - lastTarget.slide) > THRESHOLD.SLIDE;
+
+            const anyMoving = isLiftMoving || isTurnMoving || isSlideMoving;
+
+            if (!backendBusy && !anyMoving) {
+                clearTimeoutHandler();
+                setIsBusy(false);
+                setIsError(false);
+                setStatus("READY");
+                setBusyState({ lift: false, turn: false, slide: false, hook: false });
+                setLastTarget({ lift: null, turn: null, slide: null }); 
+            } else {
+                if (!isError) {
+                    setIsBusy(true);
+                    setStatus(backendBusy ? feedback || `BUSY: ${action}` : "MOVING TO TARGET...");
+                }
+                const reallyLiftBusy = (backendBusy && (action.includes("LIFT") || feedback.includes("LIFT"))) || isLiftMoving;
+                const reallyTurnBusy = (backendBusy && (action.includes("TURN") || feedback.includes("TURN"))) || isTurnMoving;
+                const reallySlideBusy = (backendBusy && (action.includes("SLIDE") || feedback.includes("SLIDE"))) || isSlideMoving;
+                const reallyHookBusy = backendBusy && (action.includes("HOOK") || action.includes("GRIPPER"));
+
+                setBusyState({ lift: reallyLiftBusy, turn: reallyTurnBusy, slide: reallySlideBusy, hook: reallyHookBusy });
             }
 
         } catch (e) { console.error(e); }
@@ -141,7 +156,7 @@ const PiggybackControl = ({ ros, savedLift, setSavedLift, savedAngle, setSavedAn
 
       return () => { statusSub.unsubscribe(); clearTimeoutHandler(); };
     }
-  }, [ros, setLiftHeight, setSlideDist, setTurntableAngle]);
+  }, [ros, setLiftHeight, setSlideDist, setTurntableAngle, lastTarget, liftHeight, slideDist, turntableAngle]);
 
   const clearTimeoutHandler = () => {
     if (timeoutRef.current) { clearTimeout(timeoutRef.current); timeoutRef.current = null; }
@@ -151,22 +166,36 @@ const PiggybackControl = ({ ros, savedLift, setSavedLift, savedAngle, setSavedAn
     clearTimeoutHandler();
     timeoutRef.current = setTimeout(() => {
         setIsError(true);
-        setStatus("TIMEOUT: NO RESPONSE");
+        setStatus("TIMEOUT: CHECK ROBOT!");
+        setLastTarget({ lift: null, turn: null, slide: null });
         setBusyState({ lift: false, turn: false, slide: false, hook: false });
     }, TIMEOUT_SEC * 1000);
   };
 
   // --- ACTIONS ---
-  const sendActionCommand = (compId, value, desc) => {
-    if (isBusy) return; // General lock
+  const sendActionCommand = (compId, value, desc, targetVal = null) => {
+    if (isBusy) return;
 
-    // ✅ Set timestamp for Grace Period
-    lastCmdTime.current = Date.now();
+    // Safety Checks
+    if ((compId === COMPONENT.LIFT || compId === COMPONENT.TURNTABLE) && slideDist > 0.05) {
+        showAlert("⚠️ SLIDE EXTENDED! CANNOT MOVE.");
+        return;
+    }
+    if (compId === COMPONENT.INSERT && value === 1 && isHookLocked) { 
+        showAlert("⚠️ GRIPPER LOCKED! CANNOT SLIDE OUT.");
+        return;
+    }
 
     setIsError(false);
-    setIsBusy(true); // Force lock immediately
+    setIsBusy(true);
     setStatus(`EXECUTING: ${desc}...`);
     startTimeout();
+
+    if (targetVal !== null) {
+        if (compId === COMPONENT.LIFT) setLastTarget(prev => ({...prev, lift: targetVal}));
+        if (compId === COMPONENT.TURNTABLE) setLastTarget(prev => ({...prev, turn: targetVal}));
+        if (compId === COMPONENT.INSERT) setLastTarget(prev => ({...prev, slide: targetVal}));
+    }
 
     if (bridgeTopic.current) {
       const payload = { type: 'PIGGYBACK_MANUAL', component: compId, value: value };
@@ -176,7 +205,7 @@ const PiggybackControl = ({ ros, savedLift, setSavedLift, savedAngle, setSavedAn
 
   const handleStop = () => {
     if (bridgeTopic.current) {
-        // Send Stop Command
+        setLastTarget({ lift: null, turn: null, slide: null }); 
         const payload = { stop: true };
         bridgeTopic.current.publish({ data: JSON.stringify(payload) });
         setStatus("🚨 STOP SENT!");
@@ -184,62 +213,52 @@ const PiggybackControl = ({ ros, savedLift, setSavedLift, savedAngle, setSavedAn
   };
 
   // --- HANDLERS ---
-
   const handleLiftLevel = (lvl) => { 
       setTargetLift(LEVEL_MAP[lvl]);
-      sendActionCommand(COMPONENT.LIFT, lvl, `LIFT LVL ${lvl+1}`);
+      sendActionCommand(COMPONENT.LIFT, lvl, `LIFT LVL ${lvl+1}`, LEVEL_MAP[lvl]);
   };
 
   const handleTurn = (dir) => {
-    // Safety
-    if (slideDist > 0.05) {
-        alert("⚠️ Cannot Turn! Slide is extended.");
-        return;
-    }
-
-    let idx = 0;
-    // Map: Right=0, Back=1, Left=2
-    if (dir === 'RIGHT') idx = 0;
-    if (dir === 'ROBOT') idx = 1;
-    if (dir === 'LEFT')  idx = 2;
-    
+    let idx = 0; let targetDeg = 0;
+    if (dir === 'RIGHT') { idx = 0; targetDeg = 0; }
+    if (dir === 'ROBOT') { idx = 1; targetDeg = 90; }
+    if (dir === 'LEFT')  { idx = 2; targetDeg = 180; }
     setActiveDir(dir);
-    sendActionCommand(COMPONENT.TURNTABLE, idx, `TURN ${dir}`);
+    sendActionCommand(COMPONENT.TURNTABLE, idx, `TURN ${dir}`, targetDeg);
   };
 
   const toggleHook = () => {
-    // Logic: Locked(True)->Send 0(Unlock)
     const valToSend = isHookLocked ? 0 : 1;
     sendActionCommand(COMPONENT.HOOK, valToSend, isHookLocked ? "UNLOCKING" : "LOCKING");
   };
 
   const handleSlideQuick = (val) => { 
-    // Safety
-    if (val > 0 && isHookLocked) {
-        alert("⚠️ Cannot Slide Out! Gripper is locked.");
-        return;
-    }
-
-    const idx = val === 0 ? 0 : 1;
+    const idx = val === 0 ? 0 : 1; 
+    const targetMeters = val === 0 ? 0.0 : MAX_SLIDE;
     setTargetSlide(val);
-    sendActionCommand(COMPONENT.INSERT, idx, idx === 0 ? "SLIDE IN" : "SLIDE OUT");
+    sendActionCommand(COMPONENT.INSERT, idx, idx === 0 ? "SLIDE IN" : "SLIDE OUT", targetMeters);
   };
 
-  const handleManualSetLift = () => setTargetLift(tempLift);
-  const handleManualSetTurn = () => setTurntableAngle(tempAngle);
-  const handleManualSetSlide = () => {
-      if (tempSlide > 0.05 && isHookLocked) {
-          alert("⚠️ Cannot Slide Out! Gripper is locked.");
-          return;
-      }
-      setTargetSlide(tempSlide);
+  const handleManualSetLift = () => {
+      setLastTarget(prev => ({...prev, lift: tempLift}));
+      setTargetLift(tempLift);
+      showAlert("⚠️ MANUAL LIFT NOT SUPPORTED YET");
   };
+  const handleManualSetTurn = () => showAlert("⚠️ MANUAL TURN NOT SUPPORTED YET");
+  const handleManualSetSlide = () => showAlert("⚠️ MANUAL SLIDE NOT SUPPORTED YET");
 
   const getDisabledClass = (isBusyAxis) => (isBusy || isBusyAxis) ? 'opacity-50 cursor-not-allowed pointer-events-none' : 'active:scale-95';
 
   return (
     <div className="h-full w-full p-2 select-none font-sans text-slate-700 bg-slate-50/50 relative">
       
+      {alertMsg && (
+          <div className="absolute top-20 left-1/2 -translate-x-1/2 z-50 bg-red-600 text-white px-6 py-3 rounded-2xl shadow-xl flex items-center gap-3 animate-bounce border-2 border-white">
+              <AlertTriangle size={24} strokeWidth={3} />
+              <span className="font-bold text-lg">{alertMsg}</span>
+          </div>
+      )}
+
       <div className="flex gap-6 h-full max-w-[1920px] mx-auto pb-20">
         
         {/* LIFT */}
@@ -262,7 +281,7 @@ const PiggybackControl = ({ ros, savedLift, setSavedLift, savedAngle, setSavedAn
                     <div className="absolute inset-0 flex flex-col justify-between py-6 opacity-20 px-4">
                         {[...Array(20)].map((_,i) => <div key={i} className="w-full h-0.5 bg-slate-400"/>)}
                     </div>
-                    {/* ✅ FIX: Use liftHeight (Real) instead of targetLift */}
+                    {/* Visual Bar */}
                     <div className="absolute w-12 h-10 bg-blue-600 rounded-xl shadow-lg border-2 border-white transition-all duration-300 ease-out z-20"
                         style={{ bottom: `${(liftHeight / MAX_HEIGHT) * 92}%` }}>
                     </div>
@@ -276,7 +295,11 @@ const PiggybackControl = ({ ros, savedLift, setSavedLift, savedAngle, setSavedAn
                                 ${isAtLevel ? 'bg-slate-800 border-slate-800 text-white shadow-lg' : 'bg-white border-slate-100 text-slate-500 hover:border-blue-200'}
                                 ${getDisabledClass(busyState.lift)}`}>
                                 <div className="flex flex-col items-start">
-                                    <span className="font-black text-sm">LEVEL {lvl + 1}</span>
+                                    <div className="flex items-center gap-2">
+                                        <span className="font-black text-sm">LEVEL {lvl + 1}</span>
+                                        {/* ✅ Green Dot Indicator inside Button */}
+                                        {isAtLevel && <div className="w-2 h-2 bg-green-400 rounded-full shadow-[0_0_8px_rgba(74,222,128,0.8)] animate-pulse"/>}
+                                    </div>
                                     <span className={`text-[10px] font-mono font-bold ${isAtLevel ? 'text-slate-400' : 'text-slate-300'}`}>{LEVEL_MAP[lvl]}m</span>
                                 </div>
                                 {busyState.lift && isAtLevel && <Activity size={16} className="animate-spin text-white"/>}
@@ -285,11 +308,11 @@ const PiggybackControl = ({ ros, savedLift, setSavedLift, savedAngle, setSavedAn
                     })}
                 </div>
             </div>
-            <div className="mt-6 pt-4 border-t border-slate-100 flex items-center justify-between">
+            <div className="mt-6 pt-4 border-t border-slate-100 flex items-center justify-between opacity-50 pointer-events-none">
                 <span className="text-[10px] font-bold text-slate-400 uppercase">Manual Height</span>
                 <div className="flex bg-slate-50 p-1 rounded-xl border border-slate-200 w-40">
-                    <input type="number" step="0.01" value={tempLift} onChange={(e) => setTempLift(parseFloat(e.target.value))} disabled={isBusy} className="w-full bg-transparent px-2 text-center font-bold text-slate-700 text-sm focus:outline-none"/>
-                    <button onClick={handleManualSetLift} disabled={isBusy} className="bg-white px-3 py-1.5 rounded-lg text-[10px] font-bold text-slate-500 shadow-sm border border-slate-100">GO</button>
+                    <input type="number" readOnly value={tempLift} className="w-full bg-transparent px-2 text-center font-bold text-slate-700 text-sm"/>
+                    <button className="bg-white px-3 py-1.5 rounded-lg text-[10px] font-bold text-slate-500 shadow-sm border border-slate-100">GO</button>
                 </div>
             </div>
         </div>
@@ -305,7 +328,7 @@ const PiggybackControl = ({ ros, savedLift, setSavedLift, savedAngle, setSavedAn
                     </div>
                 </div>
                 <div className="text-right">
-                    <div className="text-3xl font-black text-slate-800 tabular-nums">{turntableAngle < 0 ? 0 : turntableAngle.toFixed(0)}°</div>
+                    <div className="text-3xl font-black text-slate-800 tabular-nums">{turntableAngle.toFixed(0)}°</div>
                     <div className="text-[9px] font-bold text-slate-400 uppercase">Angle</div>
                 </div>
             </div>
@@ -319,8 +342,16 @@ const PiggybackControl = ({ ros, savedLift, setSavedLift, savedAngle, setSavedAn
                 <button onClick={() => handleTurn('ROBOT')} disabled={busyState.turn} className={`absolute bottom-20 left-1/2 -translate-x-1/2 w-16 h-16 rounded-2xl flex flex-col items-center justify-center shadow-lg transition-all border-2 z-30 ${activeDir === 'ROBOT' ? 'bg-purple-600 border-purple-600 text-white scale-110' : 'bg-white border-white text-slate-400 hover:text-purple-600'} ${getDisabledClass(busyState.turn)}`}>
                     <ArrowDown size={24}/><span className="text-[9px] font-bold mt-1">IN</span>
                 </button>
+
+                {/* Status Indicator (Spinning when busy) */}
+                {busyState.turn && (
+                    <div className="absolute top-10 right-10 text-purple-500 animate-spin z-40">
+                        <RefreshCw size={20} />
+                    </div>
+                )}
+
                 <div className="w-64 h-64 rounded-full bg-slate-50 border border-slate-100 flex items-center justify-center relative">
-                    {/* Visual Rotation (Clamped) */}
+                    {/* Rotating Element */}
                     <div className="w-48 h-48 rounded-full flex items-center justify-center transition-transform duration-700 ease-out relative z-10" style={{ transform: `rotate(${Math.max(0, turntableAngle)}deg)` }}>
                         <div className="absolute right-0 w-32 h-24 bg-slate-800 rounded-r-3xl border-4 border-slate-700 shadow-xl flex items-center justify-end pr-4">
                             <div className="text-white/20"><ChevronRight size={28}/></div>
@@ -329,11 +360,11 @@ const PiggybackControl = ({ ros, savedLift, setSavedLift, savedAngle, setSavedAn
                     </div>
                 </div>
             </div>
-            <div className="mt-4 pt-4 border-t border-slate-100 flex items-center justify-between">
+            <div className="mt-4 pt-4 border-t border-slate-100 flex items-center justify-between opacity-50 pointer-events-none">
                 <span className="text-[10px] font-bold text-slate-400 uppercase">Manual Angle</span>
                 <div className="flex bg-slate-50 p-1 rounded-xl border border-slate-200 w-40">
-                    <input type="number" value={tempAngle} onChange={(e) => setTempAngle(parseFloat(e.target.value))} disabled={isBusy} className="w-full bg-transparent px-2 text-center font-bold text-slate-700 text-sm focus:outline-none"/>
-                    <button onClick={handleManualSetTurn} disabled={isBusy} className="bg-white px-3 py-1.5 rounded-lg text-[10px] font-bold text-slate-500 shadow-sm border border-slate-100">GO</button>
+                    <input type="number" readOnly value={tempAngle} className="w-full bg-transparent px-2 text-center font-bold text-slate-700 text-sm"/>
+                    <button className="bg-white px-3 py-1.5 rounded-lg text-[10px] font-bold text-slate-500 shadow-sm border border-slate-100">GO</button>
                 </div>
             </div>
         </div>
@@ -355,7 +386,6 @@ const PiggybackControl = ({ ros, savedLift, setSavedLift, savedAngle, setSavedAn
                     </div>
                 </div>
                 <div className="relative h-12 bg-slate-50 rounded-2xl border border-slate-200 mb-8 overflow-hidden flex items-center px-2">
-                    {/* ✅ FIX: Use slideDist (Real) instead of targetSlide */}
                     <div className="absolute left-0 top-0 bottom-0 bg-orange-400 opacity-20 transition-all duration-300" style={{width: `${(slideDist/MAX_SLIDE)*100}%`}}></div>
                     <div className="absolute h-8 w-1 bg-orange-500 rounded-full transition-all duration-300 shadow-[0_0_10px_rgba(249,115,22,0.5)]" style={{left: `${(slideDist/MAX_SLIDE)*98}%`}}></div>
                     <div className="absolute inset-0 flex justify-between px-3 items-center opacity-40 text-[9px] font-bold"><span>HOME</span><span>MAX</span></div>
@@ -368,11 +398,11 @@ const PiggybackControl = ({ ros, savedLift, setSavedLift, savedAngle, setSavedAn
                         <ChevronsRight size={24}/> SLIDE OUT
                     </button>
                 </div>
-                <div className="mt-auto pt-4 border-t border-slate-100 flex items-center justify-between">
+                <div className="mt-auto pt-4 border-t border-slate-100 flex items-center justify-between opacity-50 pointer-events-none">
                     <span className="text-[10px] font-bold text-slate-400 uppercase">Manual Dist</span>
                     <div className="flex bg-slate-50 p-1 rounded-xl border border-slate-200 w-40">
-                        <input type="number" step="0.01" value={tempSlide} onChange={(e) => setTempSlide(parseFloat(e.target.value))} disabled={isBusy} className="w-full bg-transparent px-2 text-center font-bold text-slate-700 text-sm focus:outline-none"/>
-                        <button onClick={handleManualSetSlide} disabled={isBusy} className="bg-white px-3 py-1.5 rounded-lg text-[10px] font-bold text-slate-500 shadow-sm border border-slate-100">GO</button>
+                        <input type="number" readOnly value={tempSlide} className="w-full bg-transparent px-2 text-center font-bold text-slate-700 text-sm"/>
+                        <button className="bg-white px-3 py-1.5 rounded-lg text-[10px] font-bold text-slate-500 shadow-sm border border-slate-100">GO</button>
                     </div>
                 </div>
             </div>

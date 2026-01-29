@@ -5,7 +5,7 @@ from rclpy.node import Node
 from rclpy.action import ActionClient
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
-from std_msgs.msg import String, UInt32 # ✅ Use UInt32
+from std_msgs.msg import String, UInt32 
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 
@@ -153,9 +153,13 @@ class ActionBridge(Node):
             elif cmd_type == 'EXECUTE_MISSION':
                 self.cancel_all_goals()
                 goal = ExecuteQR.Goal()
-                goal.command_type = 3 
+                goal.command_type = 3
+                # ✅ FIX: Added iterate and data_collect as requested
+                goal.iterate = 1
+                goal.data_collect = False 
+                
                 raw_path = data.get('path', [])
-                goal.target_qr_ids = [int(x) for x in raw_path]
+                goal.target_qr_ids = [str(x) for x in raw_path]
                 self.send_qr_goal(goal, "MISSION")
 
             elif cmd_type == 'PIGGYBACK_MANUAL':
@@ -165,14 +169,13 @@ class ActionBridge(Node):
         except Exception as e:
             self.get_logger().error(f'❌ JSON Error: {e}')
 
-    # --- 🛡️ SAFETY LOGIC HERE ---
     def handle_piggyback_manual(self, data):
         comp = int(data.get('component', -1))
         val = int(data.get('value', 0))
         
         # Read Current Sensors
         current_slide = self.robot_state["piggyback"]["slide_pos"]
-        current_hook = self.robot_state["piggyback"]["hook_4"] # Using Hook 4 as ref
+        current_hook = self.robot_state["piggyback"]["hook_4"]
         
         # Thresholds
         SLIDE_EXTENDED_THRESHOLD = 5000  # > 5000 pulses = Extended
@@ -199,7 +202,7 @@ class ActionBridge(Node):
                 self.robot_state["feedback_msg"] = "SAFETY: GRIPPER IS LOCKED"
                 return
 
-        # --- EXECUTE IF SAFE ---
+        # --- EXECUTE ---
         if comp == 0:
             target = self.LIFT_POSITIONS.get(val, 103000)
             self.send_kinco_goal('k1', target, self.SPD_LIFT, f"LIFTING TO F{val+1}", "LIFTING")
@@ -292,7 +295,6 @@ class ActionBridge(Node):
         stop_cmd = Twist()
         for _ in range(5): self.cmd_vel_pub.publish(stop_cmd)
         
-        # Reset State Immediately
         self.robot_state["feedback_msg"] = "ESTOP ACTIVE"
         self.robot_state["active_action"] = "IDLE" 
         self.get_logger().warn("🚨 FORCE STOP EXECUTED")

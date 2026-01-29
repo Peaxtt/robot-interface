@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import * as ROSLIB from 'roslib';
 import { 
   Play, Trash, MapPin, CheckCircle2, Box, Anchor, 
-  ArrowUp, Square, Route, Flag, Navigation, RotateCw, Lock
+  ArrowUp, Square, Route, Flag, Navigation, RotateCw, Lock, FileText
 } from 'lucide-react';
 
 const ClosedLoopControl = ({ ros, savedPath, setSavedPath, savedStep, setSavedStep }) => {
@@ -18,31 +18,71 @@ const ClosedLoopControl = ({ ros, savedPath, setSavedPath, savedStep, setSavedSt
   const activeIdx = savedStep || 0;
   const setActiveIdx = setSavedStep || (() => {});
 
-  const [isSending, setIsSending] = useState(false); // Master Busy Flag
+  const [isSending, setIsSending] = useState(false);
   const [alignStatus, setAlignStatus] = useState("READY"); 
   const [isSettingSync, setIsSettingSync] = useState(false);
   const [finalHeading, setFinalHeading] = useState(0); 
+  
+  // Real-time Robot State
   const [currentGrid, setCurrentGrid] = useState({ x: 2, y: 0 }); 
-  const [facingDir, setFacingDir] = useState("UNKNOWN"); 
-  const [currentHeadingRad, setCurrentHeadingRad] = useState(1.5708);
+  const [realQrId, setRealQrId] = useState("NO REF"); // ✅ 1. เพิ่ม State เก็บ QR ID จริงๆ
+  const [robotHeadingDeg, setRobotHeadingDeg] = useState(0); // ✅ 2. องศาจริงของหุ่น (0-360)
+
+  // Mission Summary State
+  const [showSummary, setShowSummary] = useState(false); // ✅ 4. State โชว์สรุป
 
   // --- Refs ---
   const bridgeTopic = useRef(null);
   const isStopRequested = useRef(false);
   const pathIdsRef = useRef([]);
-  const runStartTime = useRef(0); // ✅ เพิ่ม: จำเวลาที่เริ่มกด Run
+  const runStartTime = useRef(0);
 
   // --- ROS Setup ---
   useEffect(() => {
     if (!ros) return;
     
-    // ✅ แก้ Topic ให้ตรงกับ Piggyback เพื่อความชัวร์ (/web_command_gateway)
     bridgeTopic.current = new ROSLIB.Topic({ 
       ros: ros, 
       name: '/web_command_gateway', 
       messageType: 'std_msgs/String' 
     });
     
+    // ✅ 1. Subscribe /qr_id โดยตรง เพื่อความชัวร์
+    const qrSub = new ROSLIB.Topic({
+        ros: ros,
+        name: '/qr_id',
+        messageType: 'std_msgs/String'
+    });
+    qrSub.subscribe((msg) => {
+        setRealQrId(msg.data); // เก็บค่าดิบไว้โชว์
+        
+        // อัปเดตตำแหน่ง Grid (ถ้าค่าเป็นตัวเลข)
+        const id = parseInt(msg.data);
+        if (!isNaN(id)) {
+             const r = (id - 1) % 5;
+             const c = Math.floor((id - 1) / 5);
+             setCurrentGrid({ x: c, y: r });
+        }
+    });
+
+    // ✅ 2. Subscribe /odom_qr หรือ /odom เพื่อเอาทิศทางจริง
+    const odomSub = new ROSLIB.Topic({
+        ros: ros,
+        name: '/odom_qr', // หรือ /odom ตามที่มี
+        messageType: 'nav_msgs/Odometry'
+    });
+    odomSub.subscribe((msg) => {
+        // แปลง Quaternion เป็น Degree
+        const q = msg.pose.pose.orientation;
+        const siny_cosp = 2 * (q.w * q.z + q.x * q.y);
+        const cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z);
+        const rad = Math.atan2(siny_cosp, cosy_cosp);
+        let deg = rad * (180 / Math.PI);
+        if (deg < 0) deg += 360;
+        setRobotHeadingDeg(deg); // 0=Right, 90=Up, 180=Left, 270=Down
+    });
+
+    // Bridge Status
     const statusSub = new ROSLIB.Topic({
       ros: ros,
       name: '/web_full_status',
@@ -52,77 +92,45 @@ const ClosedLoopControl = ({ ros, savedPath, setSavedPath, savedStep, setSavedSt
     statusSub.subscribe((msg) => {
       try {
         const data = JSON.parse(msg.data);
-        const action = data.active_action || "IDLE"; // กันเหนียวถ้าไม่มี field
+        const action = data.active_action || "IDLE";
         const feedback = data.feedback_msg || "";
         
-        // Logic การเช็ค Busy
-        // ถ้า action ไม่ใช่ IDLE -> ถือว่าทำงาน
         const isRobotBusy = action !== "IDLE";
-        
-        // ✅ เพิ่ม Grace Period 2 วินาที: ถ้าเพิ่งกด Run ไปไม่ถึง 2 วิ ให้ถือว่า Busy ไว้ก่อน (รอ Bridge ตื่น)
         const isGracePeriod = (Date.now() - runStartTime.current) < 2000;
 
         if (isRobotBusy || isGracePeriod) {
             setIsSending(true);
-            setAlignStatus(feedback || action); // Show status text
+            setAlignStatus(feedback || action);
             
-            // Auto Update Progress Point
-            // สมมติ Feedback ส่งมาเป็น "NAVIGATING TO QR_5"
             if (feedback && feedback.includes("QR_")) {
                 const parts = feedback.split('_');
-                // ลองหาตัวเลขจากส่วนท้าย
                 const targetIdStr = parts.find(p => !isNaN(parseInt(p)));
                 if (targetIdStr) {
-                    const targetId = parseInt(targetIdStr);
+                    const targetId = targetIdStr;
                     const idx = pathIdsRef.current.indexOf(targetId);
                     if (idx !== -1) setActiveIdx(idx);
                 }
             }
         } else {
-            // ถ้าไม่ Busy และพ้นช่วง Grace Period แล้ว -> จบงาน
             if (isSending) {
                 setIsSending(false);
                 setAlignStatus("READY");
                 
-                // ถ้าจบแบบไม่ได้กด Stop -> เคลียร์ path หรือจะค้างไว้ก็ได้ตามดีไซน์
                 if (!isStopRequested.current && pathIdsRef.current.length > 0) {
-                     // pathIdsRef.current = []; // Comment ออกถ้าอยากให้เห็นผลลัพธ์ค้างไว้
                      setAlignStatus("MISSION COMPLETED");
+                     setShowSummary(true); // ✅ 4. จบงานแล้วโชว์สรุป
                 }
             }
         }
-        
-        // อัปเดตตำแหน่งหุ่นยนต์เรียลไทม์ (ถ้ามี field qr_id)
-        if (data.qr_id && data.qr_id !== "WAIT") {
-             const qrId = parseInt(data.qr_id);
-             // แปลง QR ID กลับเป็น Grid X, Y (สูตร: id = col*5 + row + 1)
-             // row = (id - 1) % 5
-             // col = floor((id - 1) / 5)
-             const r = (qrId - 1) % 5;
-             const c = Math.floor((qrId - 1) / 5);
-             setCurrentGrid({ x: c, y: r });
-        }
-
       } catch (e) { console.error(e); }
     });
 
-    const facingSub = new ROSLIB.Topic({ 
-      ros: ros, 
-      name: '/robot_facing', 
-      messageType: 'std_msgs/String' 
-    });
-    facingSub.subscribe((msg) => setFacingDir(msg.data));
-
-    return () => { statusSub.unsubscribe(); facingSub.unsubscribe(); };
-  }, [ros, isSending]); // เพิ่ม isSending ใน dep เพื่อให้ state ไม่อมค่าเก่า
-
-  const getHeadingFromFacing = (dir) => {
-    if (dir === '+X' || dir === 'RIGHT') return 0;              
-    if (dir === '+Y' || dir === 'UP' || dir === 'ALIGNED') return Math.PI / 2; 
-    if (dir === '-X' || dir === 'LEFT') return Math.PI;         
-    if (dir === '-Y' || dir === 'DOWN') return -Math.PI / 2;    
-    return currentHeadingRad; 
-  };
+    return () => { 
+        statusSub.unsubscribe(); 
+        qrSub.unsubscribe();
+        odomSub.unsubscribe();
+    };
+  }, [ros, isSending]);
 
   // --- Handlers ---
   const handleRun = () => { 
@@ -130,13 +138,13 @@ const ClosedLoopControl = ({ ros, savedPath, setSavedPath, savedStep, setSavedSt
     
     isStopRequested.current = false; 
     setIsSending(true); 
-    runStartTime.current = Date.now(); // ✅ เริ่มจับเวลา Grace Period
+    setShowSummary(false); // ปิดสรุปเก่าถ้ามี
+    runStartTime.current = Date.now();
     setAlignStatus("STARTING...");
     
-    const missionIds = selectedPath.map(p => getQrId(p.x, p.y));
+    const missionIds = selectedPath.map(p => String(getQrId(p.x, p.y)));
     pathIdsRef.current = missionIds;
 
-    // ส่งคำสั่ง Mission
     const payload = { 
         type: 'EXECUTE_MISSION', 
         path: missionIds
@@ -147,8 +155,6 @@ const ClosedLoopControl = ({ ros, savedPath, setSavedPath, savedStep, setSavedSt
     }
     
     setActiveIdx(0);
-    const initialH = getHeadingFromFacing(facingDir);
-    setCurrentHeadingRad(initialH);
   };
 
   const handleStop = () => { 
@@ -157,10 +163,9 @@ const ClosedLoopControl = ({ ros, savedPath, setSavedPath, savedStep, setSavedSt
     pathIdsRef.current = [];
     setActiveIdx(0);
     setAlignStatus("STOPPED");
+    setShowSummary(false);
     
-    // ส่ง Stop
     if (bridgeTopic.current) {
-        // ส่ง Format เดียวกับ Piggyback เพื่อความชัวร์
         bridgeTopic.current.publish({ data: JSON.stringify({ stop: true }) }); 
     }
   };
@@ -176,6 +181,21 @@ const ClosedLoopControl = ({ ros, savedPath, setSavedPath, savedStep, setSavedSt
     else setSelectedPath([...selectedPath, { x: col, y: row }]);
   };
 
+  // --- Helper: Path Calculation for SVG ---
+  // ✅ 3. คำนวณเส้นใหม่: เอาแค่จุดที่ยังไม่เดิน (ตั้งแต activeIdx ขึ้นไป) และเชื่อมกับตำแหน่งหุ่นปัจจุบัน
+  const getPolylinePoints = () => {
+      const remainingPath = selectedPath.slice(activeIdx);
+      if (remainingPath.length === 0) return "";
+      
+      // จุดเริ่มคือตำแหน่งหุ่นปัจจุบัน
+      const startPoint = `${currentGrid.x * 20 + 10} ${100 - (currentGrid.y * 20 + 10)}`;
+      
+      // จุดต่อๆ ไปใน Path
+      const pathPoints = remainingPath.map(p => `${p.x * 20 + 10} ${100 - (p.y * 20 + 10)}`).join(' ');
+      
+      return `${startPoint} ${pathPoints}`;
+  };
+
   // --- Render ---
   const renderGrid = () => {
     let cells = [];
@@ -186,7 +206,14 @@ const ClosedLoopControl = ({ ros, savedPath, setSavedPath, savedStep, setSavedSt
         const isVisiblePoint = pathIdx !== -1; 
         const isPassed = isSending && pathIdx < activeIdx;
         const isLast = isVisiblePoint && pathIdx === selectedPath.length - 1;
-        const visualDeg = 90 - (currentHeadingRad * 180 / Math.PI);
+        
+        // ✅ 2. หมุนกล่องตาม robotHeadingDeg จริงๆ (ลบ 90 เพราะ 0 องศาของ CSS คือทิศขวา แต่ลูกศรชี้ขึ้น)
+        // หรือถ้าลูกศรใน icon ชี้ขึ้น (Up) และ 0 องศา ROS คือขวา (Right) -> ต้อง -90
+        // แต่เดี๋ยวก่อน! 
+        // ROS: 0=Right, 90=Up
+        // CSS rotate(0deg): ปกติ (หัวชี้ขึ้นถ้าใช้ ArrowUp หรือ Box ปกติ)
+        // ดังนั้น: rotate = 90 - ros_deg
+        const visualDeg = 90 - robotHeadingDeg;
 
         cells.push(
           <div key={`${col}-${row}`} onClick={() => handleGridClick(col, row)}
@@ -202,7 +229,7 @@ const ClosedLoopControl = ({ ros, savedPath, setSavedPath, savedStep, setSavedSt
             <span className="absolute top-1 left-1 text-[7px] opacity-20 font-mono font-bold">Q{getQrId(col,row)}</span>
             
             {isRobot ? (
-                <div style={{transform: `rotate(${visualDeg}deg)`}} className="transition-transform duration-500">
+                <div style={{transform: `rotate(${visualDeg}deg)`}} className="transition-transform duration-300 ease-out">
                     <Box size={24} className="text-green-600 fill-green-100"/>
                     <div className="absolute -top-3 left-1/2 -translate-x-1/2 w-0 h-0 border-l-[5px] border-l-transparent border-r-[5px] border-r-transparent border-b-[8px] border-b-green-600"/>
                 </div>
@@ -225,11 +252,43 @@ const ClosedLoopControl = ({ ros, savedPath, setSavedPath, savedStep, setSavedSt
   };
 
   return (
-    <div className="bg-white p-4 lg:p-6 rounded-2xl border border-slate-200 shadow-sm h-full flex gap-6 select-none overflow-hidden">
+    <div className="bg-white p-4 lg:p-6 rounded-2xl border border-slate-200 shadow-sm h-full flex gap-6 select-none overflow-hidden relative">
       <style>{`
         @keyframes dashflow { from { stroke-dashoffset: 20; } to { stroke-dashoffset: 0; } }
         .flowing-path { stroke-dasharray: 12, 8; animation: dashflow 1s linear infinite; will-change: stroke-dashoffset; }
       `}</style>
+
+      {/* ✅ 4. MISSION SUMMARY OVERLAY */}
+      {showSummary && (
+          <div className="absolute inset-0 z-50 bg-white/90 backdrop-blur-sm flex flex-col items-center justify-center animate-in fade-in zoom-in duration-300">
+              <div className="bg-white p-8 rounded-3xl shadow-2xl border border-blue-100 flex flex-col items-center max-w-md w-full">
+                  <div className="w-20 h-20 bg-green-100 rounded-full flex items-center justify-center mb-4">
+                      <CheckCircle2 size={48} className="text-green-600" />
+                  </div>
+                  <h2 className="text-2xl font-black text-slate-800 mb-2">MISSION COMPLETE!</h2>
+                  <p className="text-slate-500 mb-6 text-center">Robot has successfully navigated through all waypoints.</p>
+                  
+                  <div className="w-full bg-slate-50 p-4 rounded-xl border border-slate-100 mb-6">
+                      <div className="flex items-center gap-2 mb-3 text-slate-400 text-xs font-bold uppercase tracking-wider">
+                          <Route size={14}/> Path Traveled
+                      </div>
+                      <div className="flex flex-wrap gap-2">
+                          {selectedPath.map((p, i) => (
+                              <div key={i} className="flex items-center">
+                                  <span className="bg-blue-600 text-white px-2 py-1 rounded text-xs font-bold">Q{getQrId(p.x, p.y)}</span>
+                                  {i < selectedPath.length - 1 && <div className="w-4 h-0.5 bg-slate-300 mx-1"></div>}
+                              </div>
+                          ))}
+                      </div>
+                  </div>
+
+                  <div className="flex gap-3 w-full">
+                      <button onClick={() => setShowSummary(false)} className="flex-1 py-3 rounded-xl border border-slate-200 text-slate-600 font-bold hover:bg-slate-50">CLOSE</button>
+                      <button onClick={() => {setSelectedPath([]); setActiveIdx(0); setShowSummary(false);}} className="flex-1 py-3 rounded-xl bg-blue-600 text-white font-bold hover:bg-blue-700 shadow-lg shadow-blue-200">NEW MISSION</button>
+                  </div>
+              </div>
+          </div>
+      )}
 
       {/* LEFT: MAP */}
       <div className="flex-1 flex flex-col relative min-w-0">
@@ -262,7 +321,8 @@ const ClosedLoopControl = ({ ros, savedPath, setSavedPath, savedStep, setSavedSt
                 
                 <svg className="absolute inset-0 pointer-events-none w-full h-full z-20" viewBox="0 0 100 100" preserveAspectRatio="none" style={{ overflow: 'visible' }}>
                    {selectedPath.length > 0 && (
-                     <polyline points={[currentGrid, ...selectedPath].map(p => `${p.x * 20 + 10} ${100 - (p.y * 20 + 10)}`).join(' ')}
+                     /* ✅ 3. เส้นวาดเฉพาะส่วนที่เหลือ (Future Path) */
+                     <polyline points={getPolylinePoints()}
                         fill="none" 
                         stroke={isSending ? "#f97316" : "#3b82f6"} 
                         strokeWidth="3.5" vectorEffect="non-scaling-stroke" strokeLinecap="round" strokeLinejoin="round" 
@@ -285,8 +345,10 @@ const ClosedLoopControl = ({ ros, savedPath, setSavedPath, savedStep, setSavedSt
         {/* FOOTER */}
         <div className="absolute bottom-4 left-6 right-6 flex justify-between items-center text-[12px] font-mono text-slate-400 bg-white/95 backdrop-blur p-2.5 rounded-xl border border-slate-100 shadow-sm z-30 shrink-0">
             <div className="flex gap-4">
+                {/* ✅ 1. โชว์ QR ID จริงๆ ที่ได้จาก Topic */}
+                <span>QR-REF: <b className="text-purple-600 font-black">{realQrId}</b></span>
                 <span>POS: <b className="text-slate-600">({currentGrid.x}, {currentGrid.y})</b></span>
-                <span>FACING: <b className="text-blue-600 font-black">{facingDir}</b></span>
+                <span>HDG: <b className="text-blue-600 font-black">{robotHeadingDeg.toFixed(0)}°</b></span>
             </div>
             <div className="flex gap-4">
                 <span>STATUS: <b className={isSending ? "text-orange-500 animate-pulse" : "text-green-500"}>
@@ -310,13 +372,13 @@ const ClosedLoopControl = ({ ros, savedPath, setSavedPath, savedStep, setSavedSt
                 ) : (
                     selectedPath.map((p, i) => (
                         <div key={i} className={`p-3 rounded-xl border flex justify-between items-center transition-all 
-                            ${i < activeIdx && isSending ? 'bg-slate-100 border-transparent opacity-40 grayscale' 
+                            ${i < activeIdx ? 'bg-slate-50 border-transparent opacity-30 grayscale'  /* ✅ 3. ถ้าผ่านแล้วให้จางลงมากๆ */
                             : i === activeIdx && isSending ? 'bg-blue-600 text-white border-blue-700 shadow-md scale-[1.02] z-10' : 'bg-white border-slate-200 shadow-sm'}`}>
                             <div className="flex items-center gap-3">
                                 <span className={`w-6 h-6 rounded-full flex items-center justify-center text-[10px] font-bold ${i === activeIdx && isSending ? 'bg-white/20 text-white' : 'bg-blue-50 text-blue-600'}`}>{i+1}</span>
                                 <span className="text-[11px] font-bold uppercase tracking-tighter">Target Q{getQrId(p.x, p.y)}</span>
                             </div>
-                            {i < activeIdx && isSending ? <CheckCircle2 size={16} className="text-green-500" /> : i === selectedPath.length - 1 && <Navigation size={14} className={i === activeIdx && isSending ? 'text-white' : 'text-orange-500'} style={{transform: `rotate(${finalHeading}deg)`}}/>}
+                            {i < activeIdx ? <CheckCircle2 size={16} className="text-green-500" /> : i === selectedPath.length - 1 && <Navigation size={14} className={i === activeIdx && isSending ? 'text-white' : 'text-orange-500'} style={{transform: `rotate(${finalHeading}deg)`}}/>}
                         </div>
                     ))
                 )}
