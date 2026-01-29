@@ -5,17 +5,16 @@ from rclpy.node import Node
 from rclpy.action import ActionClient
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
-from std_msgs.msg import String, UInt32 
+from std_msgs.msg import String, UInt32, Bool
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
+from std_srvs.srv import Trigger 
 
-# Import Interface
 from amr_interfaces.msg import ErrorFlags
 from amr_interfaces.action import NavigateVector, ExecuteQR
 
-# Check Drivers
 try:
-    from ros2_modbus_driver.action import KincoMoving, MoonsMoving
+    from ros2_modbus_driver.action import KincoMoving, MoonsMoving, PiggybackHoming
     DRIVER_AVAILABLE = True
 except ImportError:
     DRIVER_AVAILABLE = False
@@ -24,51 +23,46 @@ except ImportError:
 import json
 import time
 import math
+import subprocess # ✅ ต้องใช้ subprocess
 
 class ActionBridge(Node):
     def __init__(self):
         super().__init__('web_action_bridge')
         
-        # ==========================================
-        # 🎯 FIX POSITIONS (LOOKUP TABLE)
-        # ==========================================
+        # ... Config ...
         self.LIFT_POSITIONS = { 0: 103000, 1: 365000, 2: 628000, 3: 890000 }
         self.SPD_LIFT = 600000 
-
         self.TURN_POSITIONS = { 0: 0, 1: 166300, 2: 330300 }
         self.SPD_TURN = 600000
-
         self.SLIDE_POSITIONS = { 0: 0, 1: 235000 }
         self.SPD_SLIDE = 400000
-
         self.HOOK_POSITIONS = { 0: 0, 1: 25000 }
         self.SPD_HOOK = 600
-        
-        self.ACTION_TIMEOUT = 30.0
+        self.ACTION_TIMEOUT = 60.0 
 
-        # 1. THREADING
         self.cb_group_web = ReentrantCallbackGroup()
         self.cb_group_action = ReentrantCallbackGroup()
 
-        # 2. COMMUNICATION
         self.create_subscription(String, '/web_command_gateway', self.web_cmd_callback, 10, callback_group=self.cb_group_web)
         self.status_pub = self.create_publisher(String, '/web_full_status', 10)
         
-        # 3. CLIENTS
         self.nav_client = ActionClient(self, NavigateVector, 'navigate_vector', callback_group=self.cb_group_action)
         self.qr_client = ActionClient(self, ExecuteQR, 'execute_qr_command', callback_group=self.cb_group_action)
         
+        self.lift_power_off_client = self.create_client(Trigger, '/modbus_device_controller/kinco_1/power_off_motor', callback_group=self.cb_group_action)
+
         self.piggy_clients = {}
+        self.homing_client = None
         if DRIVER_AVAILABLE:
             self.setup_piggyback_clients()
 
-        # State
         self._nav_handle = None
         self._qr_handle = None
+        self._homing_handle = None
         self._piggy_handles = {}
         self._pending_hooks = 0
-        self._hook_results = {'m4': None, 'm5': None}
         self._action_timer = None
+        self._lift_safety_timer = None 
         
         self.robot_state = {
             "battery": 100, 
@@ -77,16 +71,16 @@ class ActionBridge(Node):
             "active_action": "IDLE",
             "feedback_msg": "System Ready",
             "piggyback": { "lift_pos": 0, "turn_pos": 0, "slide_pos": 0, "hook_4": 0, "hook_5": 0 },
-            "hardware": {"ff": 0, "fs": 0, "fm1": 0, "fm2": 0}
+            "hardware": {"ff": 0, "fs": 0, "fm1": 0, "fm2": 0},
+            "system_health": {"bringup": False, "modbus": False}
         }
 
-        # Subscribers
         self.create_subscription(Odometry, '/odom', self.odom_cb, 10)
         self.create_subscription(Odometry, '/odom_qr', self.odom_qr_cb, 10) 
         self.create_subscription(String, '/qr_id', self.qr_id_cb, 10)
         self.create_subscription(ErrorFlags, '/motor_error_flags', self.flag_cb, 10)
         
-        # Feedback S0/S1
+        # Modbus Feedback
         self.create_subscription(UInt32, '/modbus_driver_S0/handler/kinco_1/get_actual_pos', lambda m: self.update_piggy('lift_pos', m), 10)
         self.create_subscription(UInt32, '/modbus_driver_S1/handler/kinco_2/get_actual_pos', lambda m: self.update_piggy('turn_pos', m), 10)
         self.create_subscription(UInt32, '/modbus_driver_S1/handler/kinco_3/get_actual_pos', lambda m: self.update_piggy('slide_pos', m), 10)
@@ -94,7 +88,11 @@ class ActionBridge(Node):
         self.create_subscription(UInt32, '/modbus_driver_S1/handler/moons_5/get_actual_pos', lambda m: self.update_piggy('hook_5', m), 10)
 
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
-        self.create_timer(0.1, self.publish_web_status, callback_group=self.cb_group_web)
+        
+        # Timers
+        self.create_timer(0.2, self.publish_web_status, callback_group=self.cb_group_web)
+        self.create_timer(1.0, self.check_node_health, callback_group=self.cb_group_web) # Check every 1s
+
         self.get_logger().info('✅ Action Bridge: STARTED')
 
     def setup_piggyback_clients(self):
@@ -107,12 +105,31 @@ class ActionBridge(Node):
             'm4': create_cli(MoonsMoving, '/modbus_device_controller/moons_4/moving'),
             'm5': create_cli(MoonsMoving, '/modbus_device_controller/moons_5/moving')
         }
+        self.homing_client = create_cli(PiggybackHoming, '/piggyback/home_all')
 
-    # --- CALLBACKS ---
+    # ✅ FIXED: ใช้ subprocess เช็ค Process ตรงๆ เหมือน run_all.sh
+    def check_node_health(self):
+        # 1. Check System Bringup
+        bringup_live = self.is_process_running("system_bringup.launch.py")
+        
+        # 2. Check Modbus Launch
+        modbus_live = self.is_process_running("modbus_node.launch.py")
+        
+        self.robot_state["system_health"]["bringup"] = bringup_live
+        self.robot_state["system_health"]["modbus"] = modbus_live
+
+    # ✅ Helper Function: pgrep -f "name"
+    def is_process_running(self, process_name):
+        try:
+            # return code 0 = found, 1 = not found
+            return subprocess.call(["pgrep", "-f", process_name], stdout=subprocess.DEVNULL) == 0
+        except:
+            return False
+
+    # ... (ส่วนที่เหลือเหมือนเดิมทุกประการ) ...
     def update_piggy(self, key, msg):
         val = msg.data
-        if val > 2147483647:
-            val -= 4294967296
+        if val > 2147483647: val -= 4294967296
         self.robot_state["piggyback"][key] = val
 
     def odom_cb(self, msg): pass 
@@ -131,17 +148,14 @@ class ActionBridge(Node):
         self.robot_state["hardware"]["fm1"] = msg.fm1
         self.robot_state["hardware"]["fm2"] = msg.fm2
 
-    # --- COMMAND HANDLER ---
     def web_cmd_callback(self, msg):
         try:
             data = json.loads(msg.data)
-            
             if data.get('stop') == True:
                 self.force_stop()
                 return
 
             cmd_type = data.get('type')
-
             if cmd_type == 'NAVIGATE_VECTOR':
                 self.cancel_all_goals()
                 goal = NavigateVector.Goal()
@@ -154,10 +168,8 @@ class ActionBridge(Node):
                 self.cancel_all_goals()
                 goal = ExecuteQR.Goal()
                 goal.command_type = 3
-                # ✅ FIX: Added iterate and data_collect as requested
                 goal.iterate = 1
                 goal.data_collect = False 
-                
                 raw_path = data.get('path', [])
                 goal.target_qr_ids = [str(x) for x in raw_path]
                 self.send_qr_goal(goal, "MISSION")
@@ -166,57 +178,166 @@ class ActionBridge(Node):
                 if not DRIVER_AVAILABLE: return
                 self.handle_piggyback_manual(data)
 
+            elif cmd_type == 'PIGGYBACK_HOME':
+                if not DRIVER_AVAILABLE: return
+                self.execute_homing()
+
+            elif cmd_type == 'SYSTEM_RESET':
+                self.execute_system_reset()
+
         except Exception as e:
             self.get_logger().error(f'❌ JSON Error: {e}')
 
     def handle_piggyback_manual(self, data):
         comp = int(data.get('component', -1))
         val = int(data.get('value', 0))
-        
-        # Read Current Sensors
         current_slide = self.robot_state["piggyback"]["slide_pos"]
         current_hook = self.robot_state["piggyback"]["hook_4"]
-        
-        # Thresholds
-        SLIDE_EXTENDED_THRESHOLD = 5000  # > 5000 pulses = Extended
-        HOOK_LOCKED_THRESHOLD = 5000     # > 5000 pulses = Locked
+        SLIDE_EXTENDED_THRESHOLD = 5000 
+        HOOK_LOCKED_THRESHOLD = 5000     
 
-        # 1. Hardware Error Check
         hw = self.robot_state["hardware"]
         if hw["ff"] != 0 or hw["fs"] != 0 or hw["fm1"] != 0 or hw["fm2"] != 0:
-             self.get_logger().warn("⛔ REJECT: Hardware Error Flags Active!")
-             self.robot_state["feedback_msg"] = "HARDWARE ERROR DETECTED"
+             self.robot_state["feedback_msg"] = "HARDWARE ERROR"
              return
 
-        # 2. Rule: Cannot LIFT (0) or TURN (1) if Slide is Extended
         if (comp == 0 or comp == 1):
             if current_slide > SLIDE_EXTENDED_THRESHOLD:
-                self.get_logger().warn(f"⛔ SAFETY: Cannot move {'LIFT' if comp==0 else 'TURN'} - Slide Extended ({current_slide})")
-                self.robot_state["feedback_msg"] = "SAFETY: SLIDE IS EXTENDED"
+                self.robot_state["feedback_msg"] = "SAFETY: SLIDE EXTENDED"
                 return
-
-        # 3. Rule: Cannot SLIDE OUT (comp=2, val=1) if Hook is Locked
-        if comp == 2 and val == 1: # 1 means OUT
+        if comp == 2 and val == 1: 
             if current_hook > HOOK_LOCKED_THRESHOLD:
-                self.get_logger().warn(f"⛔ SAFETY: Cannot Slide OUT - Gripper Locked ({current_hook})")
-                self.robot_state["feedback_msg"] = "SAFETY: GRIPPER IS LOCKED"
+                self.robot_state["feedback_msg"] = "SAFETY: GRIPPER LOCKED"
                 return
 
-        # --- EXECUTE ---
-        if comp == 0:
+        if comp == 0: 
             target = self.LIFT_POSITIONS.get(val, 103000)
-            self.send_kinco_goal('k1', target, self.SPD_LIFT, f"LIFTING TO F{val+1}", "LIFTING")
-        elif comp == 1:
+            self.send_kinco_goal('k1', target, self.SPD_LIFT, f"LIFTING TO F{val+1}", "LIFTING", is_lift=True)
+        elif comp == 1: 
             target = self.TURN_POSITIONS.get(val, 0)
             labels = {0: "RIGHT", 1: "LEFT", 2: "BACK"}
             self.send_kinco_goal('k2', target, self.SPD_TURN, f"TURNING {labels.get(val,'')}", "TURNING")
-        elif comp == 2:
+        elif comp == 2: 
             target = self.SLIDE_POSITIONS.get(val, 0)
             labels = {0: "IN", 1: "OUT"}
             self.send_kinco_goal('k3', target, self.SPD_SLIDE, f"SLIDING {labels.get(val,'')}", "SLIDING")
-        elif comp == 3:
+        elif comp == 3: 
             target = self.HOOK_POSITIONS.get(val, 0)
             self.send_hook_pair(target)
+
+    def execute_homing(self):
+        if not self.homing_client.wait_for_server(timeout_sec=1.0): return
+        self.cancel_all_goals()
+        goal = PiggybackHoming.Goal()
+        self.robot_state["active_action"] = "HOMING" 
+        self.robot_state["feedback_msg"] = "STARTING HOME ALL..."
+        future = self.homing_client.send_goal_async(goal, feedback_callback=self.homing_feedback)
+        future.add_done_callback(lambda f: self.handle_goal_response(f, "HOMING"))
+        self.start_action_timeout("HOMING")
+
+    def homing_feedback(self, feedback_msg):
+        msg = feedback_msg.feedback
+        self.robot_state["feedback_msg"] = f"{msg.state}"
+
+    def send_kinco_goal(self, client_key, pos, vel, status_msg, action_tag="PIGGYBACK", is_lift=False):
+        client = self.piggy_clients.get(client_key)
+        if not client or not client.wait_for_server(timeout_sec=0.5): return
+        self.robot_state["active_action"] = action_tag
+        self.robot_state["feedback_msg"] = status_msg
+        goal = KincoMoving.Goal()
+        goal.target_position = int(pos)
+        goal.velocity = int(vel)
+        future = client.send_goal_async(goal)
+        future.add_done_callback(lambda f: self.kinco_goal_accepted(f, client_key, is_lift))
+        self.start_action_timeout(action_tag)
+
+    def kinco_goal_accepted(self, future, client_key, is_lift):
+        try:
+            goal_handle = future.result()
+            if not goal_handle.accepted:
+                self.robot_state["active_action"] = "IDLE"
+                self.robot_state["feedback_msg"] = "GOAL REJECTED"
+                return
+            result_future = goal_handle.get_result_async()
+            result_future.add_done_callback(lambda f: self.kinco_result_done(f, client_key, is_lift))
+        except Exception as e:
+            self.get_logger().error(f"Kinco Goal Error: {e}")
+            self.robot_state["active_action"] = "IDLE"
+
+    def kinco_result_done(self, future, client_key, is_lift):
+        self.cancel_action_timeout()
+        if is_lift:
+             self.robot_state["feedback_msg"] = "LIFT HOLDING..."
+             self._lift_safety_timer = self.create_timer(1.0, self.trigger_lift_power_off)
+        else:
+             self.robot_state["active_action"] = "IDLE"
+             self.robot_state["feedback_msg"] = "DONE"
+
+    def send_hook_pair(self, target_pos):
+        self.robot_state["active_action"] = "GRIPPER"
+        self._pending_hooks = 2
+        self.send_moons('m4', target_pos)
+        self.send_moons('m5', target_pos)
+        self.start_action_timeout('GRIPPER')
+
+    def send_moons(self, key, pos):
+        client = self.piggy_clients.get(key)
+        if not client or not client.wait_for_server(timeout_sec=0.5):
+            self._pending_hooks -= 1
+            if self._pending_hooks <= 0: 
+                self.robot_state["active_action"] = "IDLE"
+            return
+        goal = MoonsMoving.Goal()
+        goal.target_position = int(pos)
+        goal.velocity = self.SPD_HOOK
+        future = client.send_goal_async(goal)
+        future.add_done_callback(lambda f: self.moons_goal_accepted(f, key))
+
+    def moons_goal_accepted(self, future, key):
+        try:
+            goal_handle = future.result()
+            if not goal_handle.accepted:
+                self._pending_hooks -= 1
+                return
+            result_future = goal_handle.get_result_async()
+            result_future.add_done_callback(lambda f: self.moons_result_done(f, key))
+        except: pass
+
+    def moons_result_done(self, future, key):
+        self._pending_hooks -= 1
+        if self._pending_hooks <= 0:
+            self.robot_state["active_action"] = "IDLE"
+            self.robot_state["feedback_msg"] = "HOOK DONE"
+            self.cancel_action_timeout()
+
+    def trigger_lift_power_off(self):
+        if self._lift_safety_timer: self._lift_safety_timer.cancel()
+        req = Trigger.Request()
+        future = self.lift_power_off_client.call_async(req)
+        future.add_done_callback(self.lift_off_done)
+
+    def lift_off_done(self, future):
+        self.robot_state["active_action"] = "IDLE"
+        self.robot_state["feedback_msg"] = "LIFT LOCKED (OFF)"
+        self.cancel_action_timeout()
+
+    def handle_goal_response(self, future, action_name):
+        try:
+            handle = future.result()
+            if not handle.accepted:
+                self.robot_state["active_action"] = "IDLE"
+                self.robot_state["feedback_msg"] = "GOAL REJECTED"
+                return
+            if action_name == "NAVIGATION": self._nav_handle = handle
+            if action_name == "QR": self._qr_handle = handle
+            if action_name == "HOMING": self._homing_handle = handle
+            handle.get_result_async().add_done_callback(self.action_done)
+        except: pass
+
+    def action_done(self, future):
+        self.robot_state["active_action"] = "IDLE"
+        self.robot_state["feedback_msg"] = "COMPLETED"
+        self.cancel_action_timeout()
 
     def send_nav_goal(self, goal):
         if not self.nav_client.wait_for_server(timeout_sec=1.0): return
@@ -232,69 +353,32 @@ class ActionBridge(Node):
         future.add_done_callback(lambda f: self.handle_goal_response(f, "QR"))
         self.start_action_timeout(mode_name)
 
-    def send_kinco_goal(self, client_key, pos, vel, status_msg, action_tag="PIGGYBACK"):
-        client = self.piggy_clients.get(client_key)
-        if not client or not client.wait_for_server(timeout_sec=0.5): return
-        self.robot_state["active_action"] = action_tag
-        self.robot_state["feedback_msg"] = status_msg
-        goal = KincoMoving.Goal()
-        goal.target_position = int(pos)
-        goal.velocity = int(vel)
-        future = client.send_goal_async(goal)
-        future.add_done_callback(lambda f: self.piggy_done(f, client_key))
-        self.start_action_timeout(action_tag)
-
-    def send_hook_pair(self, target_pos):
-        self.robot_state["active_action"] = "GRIPPER"
-        self._pending_hooks = 2
-        self.send_moons('m4', target_pos)
-        self.send_moons('m5', target_pos)
-        self.start_action_timeout('GRIPPER')
-
-    def send_moons(self, key, pos):
-        client = self.piggy_clients.get(key)
-        if not client or not client.wait_for_server(timeout_sec=0.5):
-            self._pending_hooks -= 1
-            if self._pending_hooks <= 0: self.piggy_done(None, "HOOK")
-            return
-        goal = MoonsMoving.Goal()
-        goal.target_position = int(pos)
-        goal.velocity = self.SPD_HOOK
-        future = client.send_goal_async(goal)
-        future.add_done_callback(lambda f: self.hook_done(f, key))
-
-    def handle_goal_response(self, future, action_name):
+    # ในไฟล์ action_bridge.py
+    def execute_system_reset(self):
+        self.get_logger().warn("🔄 SYSTEM RESET REQUESTED")
+        self.robot_state["feedback_msg"] = "RESETTING SYSTEM..."
+        self.publish_web_status()
+        
+        # ✅ วิธีแก้: ใช้ start_new_session=True เพื่อแยก Process ออกจาก Python
+        # แม้ Python (Action Bridge) จะโดนฆ่าตาย Script นี้จะยังทำงานต่อจนจบ
+        import subprocess
         try:
-            handle = future.result()
-            if not handle.accepted:
-                self.robot_state["active_action"] = "IDLE"
-                return
-            if action_name == "NAVIGATION": self._nav_handle = handle
-            if action_name == "QR": self._qr_handle = handle
-            handle.get_result_async().add_done_callback(self.action_done)
-        except: pass
-
-    def action_done(self, future):
-        self.robot_state["active_action"] = "IDLE"
-        self.cancel_action_timeout()
-
-    def piggy_done(self, future, key):
-        self.robot_state["active_action"] = "IDLE"
-        self.robot_state["feedback_msg"] = "DONE"
-        self.cancel_action_timeout()
-
-    def hook_done(self, future, key):
-        self._pending_hooks -= 1
-        if self._pending_hooks <= 0:
-            self.robot_state["active_action"] = "IDLE"
-            self.robot_state["feedback_msg"] = "HOOK DONE"
-            self.cancel_action_timeout()
+             subprocess.Popen(
+                 ["/home/admin/reset_system.sh"], 
+                 shell=True,
+                 stdin=None, 
+                 stdout=None, 
+                 stderr=None, 
+                 close_fds=True,
+                 start_new_session=True # <--- 🔑 กุญแจสำคัญคือบรรทัดนี้!
+             )
+        except Exception as e:
+             self.get_logger().error(f"Reset Script Failed: {e}")
 
     def force_stop(self):
         self.cancel_all_goals()
         stop_cmd = Twist()
         for _ in range(5): self.cmd_vel_pub.publish(stop_cmd)
-        
         self.robot_state["feedback_msg"] = "ESTOP ACTIVE"
         self.robot_state["active_action"] = "IDLE" 
         self.get_logger().warn("🚨 FORCE STOP EXECUTED")
@@ -308,6 +392,10 @@ class ActionBridge(Node):
             try: self._qr_handle.cancel_goal_async()
             except: pass
             self._qr_handle = None
+        if self._homing_handle:
+            try: self._homing_handle.cancel_goal_async()
+            except: pass
+            self._homing_handle = None
         self.cancel_action_timeout()
 
     def start_action_timeout(self, name):

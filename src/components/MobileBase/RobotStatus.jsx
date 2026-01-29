@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import * as ROSLIB from 'roslib'; 
 import { 
-  Activity, Battery, Wifi, Navigation, AlertTriangle, CheckCircle2, Scan, Zap, Crosshair, AlertOctagon
+  Activity, Battery, Wifi, Navigation, AlertTriangle, CheckCircle2, Scan, AlertOctagon
 } from 'lucide-react';
 
 const RobotStatus = ({ ros }) => {
@@ -13,10 +13,13 @@ const RobotStatus = ({ ros }) => {
   
   // Status States
   const [isEmergency, setIsEmergency] = useState(false);
-  const [isWarning, setIsWarning] = useState(false); // ✅ สถานะเตือนสีเหลือง (Launch Check)
+  const [isWarning, setIsWarning] = useState(false);
   const [errorText, setErrorText] = useState("SYSTEM NOMINAL"); 
   const [isConnected, setIsConnected] = useState(false);
-  const [lastHeartbeat, setLastHeartbeat] = useState(0); // ✅ จับเวลา Heartbeat ล่าสุด
+  const [lastHeartbeat, setLastHeartbeat] = useState(0); 
+  
+  // ✅ เพิ่ม state รับค่า Health จาก Backend
+  const [health, setHealth] = useState({ bringup: true, modbus: true });
   
   // Vision & Localization State
   const [qrRaw, setQrRaw] = useState({ visible: false, id: -1 }); 
@@ -24,7 +27,6 @@ const RobotStatus = ({ ros }) => {
   const [qrOdom, setQrOdom] = useState({ x: 0, y: 0, th: 0 });    
   
   const watchdogRef = useRef(null);
-  const qrTimeoutRef = useRef(null);
 
   // --- HELPER FUNCTIONS ---
   const getYawFromQuat = (q) => {
@@ -53,39 +55,39 @@ const RobotStatus = ({ ros }) => {
       return "LIMIT";
   };
 
-  // ✅ CHECK SYSTEM HEALTH (Launch Check)
+  // ✅ CHECK SYSTEM HEALTH (Launch Check Logic ใหม่)
   useEffect(() => {
       const healthCheck = setInterval(() => {
           const now = Date.now();
           
           if (!isConnected) {
-              // Case 1: ROS Disconnected (Red)
-              setIsEmergency(true);
-              setIsWarning(false);
-              setErrorText("ROS DISCONNECTED");
+              // 1. Connection หลุด (แดง)
+              setIsEmergency(true); setIsWarning(false); setErrorText("ROS DISCONNECTED");
           } else if (now - lastHeartbeat > 3000) {
-              // Case 2: Bridge เงียบเกิน 3 วิ (Yellow) -> ลืม Launch Action Bridge?
-              setIsEmergency(false);
-              setIsWarning(true);
-              setErrorText("CHECK BRIDGE NODE");
-          } else if (odom.x === 0 && odom.y === 0 && battery === 0) {
-              // Case 3: Bridge มา แต่ค่าเป็น 0 หมด (Yellow) -> ลืม Launch Driver/System Bringup?
-              setIsEmergency(false);
-              setIsWarning(true);
-              setErrorText("CHECK SYSTEM LAUNCH");
+              // 2. Bridge เงียบเกิน 3 วิ (เหลือง)
+              setIsEmergency(false); setIsWarning(true); setErrorText("BRIDGE NOT RESPONDING");
+          
+          // ✅ 3. เช็ค Launch Modbus (Backend บอกมา)
+          } else if (!health.modbus) {
+              setIsEmergency(false); setIsWarning(true); setErrorText("LAUNCH MODBUS!");
+          
+          // ✅ 4. เช็ค Launch Bringup (Backend บอกมา)
+          } else if (!health.bringup) {
+              setIsEmergency(false); setIsWarning(true); setErrorText("LAUNCH BRINGUP!");
+              
           } else if (!isEmergency) {
-              // Case 4: Normal (Green/Blue)
+              // 5. ปกติ (เขียว)
               setIsWarning(false);
           }
       }, 1000);
       return () => clearInterval(healthCheck);
-  }, [isConnected, lastHeartbeat, odom, battery, isEmergency]);
+  }, [isConnected, lastHeartbeat, isEmergency, health]); // เพิ่ม health dependency
 
 
   useEffect(() => {
     if (!ros) { setIsConnected(false); return; }
 
-    // 1. BRIDGE STATUS (Heartbeat)
+    // 1. BRIDGE STATUS
     const bridgeSub = new ROSLIB.Topic({ 
         ros: ros, name: '/web_full_status', messageType: 'std_msgs/String' 
     });
@@ -94,7 +96,7 @@ const RobotStatus = ({ ros }) => {
         try {
             const data = JSON.parse(msg.data);
             setIsConnected(true);
-            setLastHeartbeat(Date.now()); // Update Heartbeat time
+            setLastHeartbeat(Date.now());
 
             if(watchdogRef.current) clearTimeout(watchdogRef.current);
             watchdogRef.current = setTimeout(() => setIsConnected(false), 5000);
@@ -103,6 +105,11 @@ const RobotStatus = ({ ros }) => {
             setFlags(data.hardware || { ff: 0, fs: 0, fm1: 0, fm2: 0 });
             setBattery(data.battery || 0);
             setVoltage(data.voltage || 0);
+            
+            // ✅ รับค่า Health จริงจาก Backend
+            if (data.system_health) {
+                setHealth(data.system_health);
+            }
 
             // Error Logic
             const ffText = decodeFF(data.hardware?.ff || 0);
@@ -110,15 +117,13 @@ const RobotStatus = ({ ros }) => {
             const fm2Text = data.hardware?.fm2 ? `M2:${decodeFM(data.hardware.fm2)}` : "";
 
             if (ffText || data.hardware?.fm1 || data.hardware?.fm2) {
-                // Real Error (Red)
                 setIsEmergency(true);
                 setIsWarning(false);
                 setErrorText(ffText || `${fm1Text} ${fm2Text}`.trim());
             } else {
-                // No Error (Reset Red, Yellow handled by healthCheck effect)
                 setIsEmergency(false);
-                // Only update text if not in warning state
-                if (!isWarning) {
+                // ถ้าไม่มี Error และ Launch ครบ ให้โชว์ Action
+                if (!isWarning && health.modbus && health.bringup) {
                     setErrorText(data.active_action !== 'IDLE' ? data.active_action : "SYSTEM NOMINAL");
                 }
             }
@@ -158,27 +163,27 @@ const RobotStatus = ({ ros }) => {
         qrRawSub.unsubscribe();
         if(watchdogRef.current) clearTimeout(watchdogRef.current);
     };
-  }, [ros, isWarning]); // Add dependency
+  }, [ros, isWarning, health]);
 
   // --- RENDER ---
   return (
     <div className="h-full bg-white border border-slate-200 rounded-xl shadow-sm flex items-center px-2 py-1 gap-2 overflow-hidden select-none">
       
-      {/* 1. SYSTEM STATUS (Tri-State Color: Red/Yellow/Green) */}
+      {/* 1. SYSTEM STATUS */}
       <div className={`w-60 shrink-0 flex items-center gap-3 p-2 rounded-lg border-l-4 transition-all duration-500
           ${!isConnected ? 'bg-slate-100 border-slate-400' 
           : isEmergency ? 'bg-red-50 border-red-500' 
-          : isWarning ? 'bg-yellow-50 border-yellow-500' // ✅ สีเหลืองเมื่อลืม Launch
+          : isWarning ? 'bg-yellow-50 border-yellow-500' // สีเหลืองเตือน Launch
           : 'bg-slate-800 border-green-500'}`}>
          
          <div className={`p-2 rounded-full 
             ${!isConnected ? 'text-slate-400' 
             : isEmergency ? 'bg-red-100 text-red-600 animate-pulse' 
-            : isWarning ? 'bg-yellow-100 text-yellow-600 animate-bounce' // ✅ Icon เด้งๆ เตือน
+            : isWarning ? 'bg-yellow-100 text-yellow-600 animate-bounce'
             : 'bg-white/10 text-green-400'}`}>
             {!isConnected ? <Wifi size={20}/> 
              : isEmergency ? <AlertTriangle size={20}/> 
-             : isWarning ? <AlertOctagon size={20}/> // ✅ Icon เปลี่ยน
+             : isWarning ? <AlertOctagon size={20}/> 
              : <CheckCircle2 size={20}/>}
          </div>
          
@@ -187,7 +192,7 @@ const RobotStatus = ({ ros }) => {
             <span className={`text-sm font-black truncate 
                 ${!isConnected ? 'text-slate-500' 
                 : isEmergency ? 'text-red-600' 
-                : isWarning ? 'text-yellow-600' // ✅ Text สีเหลือง
+                : isWarning ? 'text-yellow-600' // ข้อความเหลือง
                 : 'text-white'}`}>
                 {!isConnected ? "OFFLINE" : errorText}
             </span>

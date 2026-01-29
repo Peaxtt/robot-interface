@@ -3,7 +3,7 @@ import * as ROSLIB from 'roslib';
 import { 
   MoveVertical, RotateCw, Settings, 
   ChevronLeft, ChevronRight, ArrowDown, 
-  Lock, Unlock, RefreshCw, Target, ChevronsLeft, ChevronsRight, Octagon, Activity, AlertTriangle
+  Lock, Unlock, RefreshCw, Target, ChevronsLeft, ChevronsRight, Octagon, Activity, AlertTriangle, Home
 } from 'lucide-react';
 
 const PiggybackControl = ({ ros, savedLift, setSavedLift, savedAngle, setSavedAngle }) => {
@@ -11,7 +11,7 @@ const PiggybackControl = ({ ros, savedLift, setSavedLift, savedAngle, setSavedAn
   const LEVEL_MAP = [0.16, 0.58, 1.00, 1.42]; 
   const MAX_HEIGHT = 1.5; 
   const MAX_SLIDE = 0.5;
-  const TIMEOUT_SEC = 30;
+  const TIMEOUT_SEC = 60; // เพิ่มเวลาเผื่อ Homing
 
   // Pulse Constants
   const PULSE_PER_METER = 625000.0;
@@ -20,12 +20,7 @@ const PiggybackControl = ({ ros, savedLift, setSavedLift, savedAngle, setSavedAn
   const PULSE_SLIDE_MAX = 235000.0;
 
   // Thresholds
-  const THRESHOLD = {
-      LIFT: 0.03, // 3 cm
-      TURN: 3.0,  // 3 degrees
-      SLIDE: 0.03 // 3 cm
-  };
-
+  const THRESHOLD = { LIFT: 0.03, TURN: 3.0, SLIDE: 0.03 };
   const COMPONENT = { LIFT: 0, TURNTABLE: 1, INSERT: 2, HOOK: 3 };
 
   // --- STATE ---
@@ -36,8 +31,6 @@ const PiggybackControl = ({ ros, savedLift, setSavedLift, savedAngle, setSavedAn
 
   // Target State
   const [lastTarget, setLastTarget] = useState({ lift: null, turn: null, slide: null });
-
-  // Busy State
   const [busyState, setBusyState] = useState({ lift: false, turn: false, slide: false, hook: false });
 
   // Real-time Values
@@ -96,16 +89,13 @@ const PiggybackControl = ({ ros, savedLift, setSavedLift, savedAngle, setSavedAn
             let currentSlide = slideDist;
 
             if (data.piggyback) {
-                // Lift
                 currentLift = parsePulse(data.piggyback.lift_pos) / PULSE_PER_METER;
                 setLiftHeight(currentLift);
 
-                // Slide
                 const rawSlide = parsePulse(data.piggyback.slide_pos);
                 currentSlide = (rawSlide / PULSE_SLIDE_MAX) * MAX_SLIDE;
                 setSlideDist(currentSlide);
 
-                // Turn
                 const rawTurn = parsePulse(data.piggyback.turn_pos);
                 let realAngle = 0;
                 if (rawTurn <= 0) realAngle = 0;
@@ -117,38 +107,46 @@ const PiggybackControl = ({ ros, savedLift, setSavedLift, savedAngle, setSavedAn
                 currentTurn = Math.max(0, Math.min(180, realAngle));
                 setTurntableAngle(currentTurn);
 
-                // Hook
                 setIsHookLocked(parsePulse(data.piggyback.hook_4) > 5000); 
             }
 
-            // 2. CHECK TARGET REACHED
+            // 2. BUSY LOGIC (ปรับให้รองรับ Homing และ Lift Safety)
             const backendBusy = action !== "IDLE";
-            let isLiftMoving = false, isTurnMoving = false, isSlideMoving = false;
-
-            if (lastTarget.lift !== null) isLiftMoving = Math.abs(currentLift - lastTarget.lift) > THRESHOLD.LIFT;
-            if (lastTarget.turn !== null) isTurnMoving = Math.abs(currentTurn - lastTarget.turn) > THRESHOLD.TURN;
-            if (lastTarget.slide !== null) isSlideMoving = Math.abs(currentSlide - lastTarget.slide) > THRESHOLD.SLIDE;
-
-            const anyMoving = isLiftMoving || isTurnMoving || isSlideMoving;
-
-            if (!backendBusy && !anyMoving) {
-                clearTimeoutHandler();
-                setIsBusy(false);
-                setIsError(false);
-                setStatus("READY");
-                setBusyState({ lift: false, turn: false, slide: false, hook: false });
-                setLastTarget({ lift: null, turn: null, slide: null }); 
-            } else {
-                if (!isError) {
-                    setIsBusy(true);
-                    setStatus(backendBusy ? feedback || `BUSY: ${action}` : "MOVING TO TARGET...");
-                }
-                const reallyLiftBusy = (backendBusy && (action.includes("LIFT") || feedback.includes("LIFT"))) || isLiftMoving;
-                const reallyTurnBusy = (backendBusy && (action.includes("TURN") || feedback.includes("TURN"))) || isTurnMoving;
-                const reallySlideBusy = (backendBusy && (action.includes("SLIDE") || feedback.includes("SLIDE"))) || isSlideMoving;
-                const reallyHookBusy = backendBusy && (action.includes("HOOK") || action.includes("GRIPPER"));
-
+            
+            // ถ้า Backend บอกว่า Busy ให้เชื่อ Backend ก่อนเลย (เพราะมี Homing/Safety Delay)
+            if (backendBusy) {
+                clearTimeoutHandler(); // Reset timeout while busy
+                setIsBusy(true);
+                setStatus(feedback || `BUSY: ${action}`);
+                
+                // Update specific busy flags for UI animation
+                const reallyLiftBusy = action.includes("LIFT") || feedback.includes("LIFT");
+                const reallyTurnBusy = action.includes("TURN") || feedback.includes("TURN");
+                const reallySlideBusy = action.includes("SLIDE") || feedback.includes("SLIDE");
+                const reallyHookBusy = action.includes("HOOK") || action.includes("GRIPPER");
+                
                 setBusyState({ lift: reallyLiftBusy, turn: reallyTurnBusy, slide: reallySlideBusy, hook: reallyHookBusy });
+            
+            } else {
+                // Backend IDLE -> Check if we reached targets manually
+                // (เผื่อ ROS lag หรือ update ไม่ทัน)
+                let isLiftMoving = false, isTurnMoving = false, isSlideMoving = false;
+                if (lastTarget.lift !== null) isLiftMoving = Math.abs(currentLift - lastTarget.lift) > THRESHOLD.LIFT;
+                if (lastTarget.turn !== null) isTurnMoving = Math.abs(currentTurn - lastTarget.turn) > THRESHOLD.TURN;
+                if (lastTarget.slide !== null) isSlideMoving = Math.abs(currentSlide - lastTarget.slide) > THRESHOLD.SLIDE;
+
+                if (isLiftMoving || isTurnMoving || isSlideMoving) {
+                     // Still moving to target physically
+                     setIsBusy(true);
+                     setStatus("MOVING TO TARGET...");
+                } else {
+                     // Completely Idle
+                     setIsBusy(false);
+                     setIsError(false);
+                     setStatus("READY");
+                     setBusyState({ lift: false, turn: false, slide: false, hook: false });
+                     setLastTarget({ lift: null, turn: null, slide: null });
+                }
             }
 
         } catch (e) { console.error(e); }
@@ -169,6 +167,7 @@ const PiggybackControl = ({ ros, savedLift, setSavedLift, savedAngle, setSavedAn
         setStatus("TIMEOUT: CHECK ROBOT!");
         setLastTarget({ lift: null, turn: null, slide: null });
         setBusyState({ lift: false, turn: false, slide: false, hook: false });
+        setIsBusy(false); // Force unlock on timeout
     }, TIMEOUT_SEC * 1000);
   };
 
@@ -176,7 +175,6 @@ const PiggybackControl = ({ ros, savedLift, setSavedLift, savedAngle, setSavedAn
   const sendActionCommand = (compId, value, desc, targetVal = null) => {
     if (isBusy) return;
 
-    // Safety Checks
     if ((compId === COMPONENT.LIFT || compId === COMPONENT.TURNTABLE) && slideDist > 0.05) {
         showAlert("⚠️ SLIDE EXTENDED! CANNOT MOVE.");
         return;
@@ -212,6 +210,19 @@ const PiggybackControl = ({ ros, savedLift, setSavedLift, savedAngle, setSavedAn
     }
   };
 
+  // ✅ NEW: Home All Function
+  const handleHomeAll = () => {
+    if (isBusy) return;
+    if (window.confirm("⚠️ WARNING: RESET ALL MOTORS TO HOME?")) {
+        setIsBusy(true);
+        setStatus("HOMING SYSTEM...");
+        if (bridgeTopic.current) {
+            const payload = { type: 'PIGGYBACK_HOME' };
+            bridgeTopic.current.publish({ data: JSON.stringify(payload) });
+        }
+    }
+  };
+
   // --- HANDLERS ---
   const handleLiftLevel = (lvl) => { 
       setTargetLift(LEVEL_MAP[lvl]);
@@ -238,14 +249,6 @@ const PiggybackControl = ({ ros, savedLift, setSavedLift, savedAngle, setSavedAn
     setTargetSlide(val);
     sendActionCommand(COMPONENT.INSERT, idx, idx === 0 ? "SLIDE IN" : "SLIDE OUT", targetMeters);
   };
-
-  const handleManualSetLift = () => {
-      setLastTarget(prev => ({...prev, lift: tempLift}));
-      setTargetLift(tempLift);
-      showAlert("⚠️ MANUAL LIFT NOT SUPPORTED YET");
-  };
-  const handleManualSetTurn = () => showAlert("⚠️ MANUAL TURN NOT SUPPORTED YET");
-  const handleManualSetSlide = () => showAlert("⚠️ MANUAL SLIDE NOT SUPPORTED YET");
 
   const getDisabledClass = (isBusyAxis) => (isBusy || isBusyAxis) ? 'opacity-50 cursor-not-allowed pointer-events-none' : 'active:scale-95';
 
@@ -297,7 +300,7 @@ const PiggybackControl = ({ ros, savedLift, setSavedLift, savedAngle, setSavedAn
                                 <div className="flex flex-col items-start">
                                     <div className="flex items-center gap-2">
                                         <span className="font-black text-sm">LEVEL {lvl + 1}</span>
-                                        {/* ✅ Green Dot Indicator inside Button */}
+                                        {/* Green Dot */}
                                         {isAtLevel && <div className="w-2 h-2 bg-green-400 rounded-full shadow-[0_0_8px_rgba(74,222,128,0.8)] animate-pulse"/>}
                                     </div>
                                     <span className={`text-[10px] font-mono font-bold ${isAtLevel ? 'text-slate-400' : 'text-slate-300'}`}>{LEVEL_MAP[lvl]}m</span>
@@ -343,7 +346,6 @@ const PiggybackControl = ({ ros, savedLift, setSavedLift, savedAngle, setSavedAn
                     <ArrowDown size={24}/><span className="text-[9px] font-bold mt-1">IN</span>
                 </button>
 
-                {/* Status Indicator (Spinning when busy) */}
                 {busyState.turn && (
                     <div className="absolute top-10 right-10 text-purple-500 animate-spin z-40">
                         <RefreshCw size={20} />
@@ -351,7 +353,6 @@ const PiggybackControl = ({ ros, savedLift, setSavedLift, savedAngle, setSavedAn
                 )}
 
                 <div className="w-64 h-64 rounded-full bg-slate-50 border border-slate-100 flex items-center justify-center relative">
-                    {/* Rotating Element */}
                     <div className="w-48 h-48 rounded-full flex items-center justify-center transition-transform duration-700 ease-out relative z-10" style={{ transform: `rotate(${Math.max(0, turntableAngle)}deg)` }}>
                         <div className="absolute right-0 w-32 h-24 bg-slate-800 rounded-r-3xl border-4 border-slate-700 shadow-xl flex items-center justify-end pr-4">
                             <div className="text-white/20"><ChevronRight size={28}/></div>
@@ -436,8 +437,16 @@ const PiggybackControl = ({ ros, savedLift, setSavedLift, savedAngle, setSavedAn
         </div>
       </div>
 
-      {/* Footer Status & STOP BUTTON */}
+      {/* Footer Status & BUTTONS */}
       <div className="fixed bottom-4 right-6 flex items-center gap-4">
+         
+         {/* ✅ NEW: HOME ALL BUTTON (แทรกตรงนี้) */}
+         <button onClick={handleHomeAll} disabled={isBusy} 
+            className={`flex items-center gap-2 px-4 py-2 rounded-full shadow-lg font-black border-2 transition-all active:scale-95
+            ${isBusy ? 'bg-slate-200 text-slate-400 border-slate-300 cursor-not-allowed' : 'bg-yellow-500 text-white border-yellow-300 hover:bg-yellow-500'}`}>
+            <Home size={16} fill="white"/> HOME ALL
+         </button>
+
          <button onClick={handleStop} className="flex items-center gap-2 px-4 py-2 bg-red-600 text-white rounded-full shadow-lg hover:bg-red-700 active:scale-95 transition-all font-black border-2 border-red-500 animate-pulse">
             <Octagon size={20} fill="white" className="text-red-600"/> STOP
          </button>
