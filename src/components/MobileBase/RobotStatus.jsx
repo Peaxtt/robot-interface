@@ -131,7 +131,7 @@ const RobotStatus = ({ ros }) => {
     });
 
     // 2. CONFIRMED QR ID
-    const qrIdSub = new ROSLIB.Topic({ ros: ros, name: '/qr_id', messageType: 'std_msgs/Int32' });
+    const qrIdSub = new ROSLIB.Topic({ ros: ros, name: '/qr_id', messageType: 'std_msgs/String' });
     qrIdSub.subscribe((msg) => setConfirmedQrId(msg.data));
 
     // 3. QR ODOMETRY

@@ -23,7 +23,7 @@ except ImportError:
 import json
 import time
 import math
-import subprocess # ✅ ต้องใช้ subprocess
+import subprocess 
 
 class ActionBridge(Node):
     def __init__(self):
@@ -48,7 +48,6 @@ class ActionBridge(Node):
         
         self.nav_client = ActionClient(self, NavigateVector, 'navigate_vector', callback_group=self.cb_group_action)
         self.qr_client = ActionClient(self, ExecuteQR, 'execute_qr_command', callback_group=self.cb_group_action)
-        
         self.lift_power_off_client = self.create_client(Trigger, '/modbus_device_controller/kinco_1/power_off_motor', callback_group=self.cb_group_action)
 
         self.piggy_clients = {}
@@ -80,7 +79,6 @@ class ActionBridge(Node):
         self.create_subscription(String, '/qr_id', self.qr_id_cb, 10)
         self.create_subscription(ErrorFlags, '/motor_error_flags', self.flag_cb, 10)
         
-        # Modbus Feedback
         self.create_subscription(UInt32, '/modbus_driver_S0/handler/kinco_1/get_actual_pos', lambda m: self.update_piggy('lift_pos', m), 10)
         self.create_subscription(UInt32, '/modbus_driver_S1/handler/kinco_2/get_actual_pos', lambda m: self.update_piggy('turn_pos', m), 10)
         self.create_subscription(UInt32, '/modbus_driver_S1/handler/kinco_3/get_actual_pos', lambda m: self.update_piggy('slide_pos', m), 10)
@@ -89,11 +87,11 @@ class ActionBridge(Node):
 
         self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         
-        # Timers
-        self.create_timer(0.2, self.publish_web_status, callback_group=self.cb_group_web)
-        self.create_timer(1.0, self.check_node_health, callback_group=self.cb_group_web) # Check every 1s
+        # ปรับความถี่การส่งข้อมูลเป็น 10Hz (0.1s)
+        self.create_timer(0.1, self.publish_web_status, callback_group=self.cb_group_web)
+        self.create_timer(1.0, self.check_node_health, callback_group=self.cb_group_web) 
 
-        self.get_logger().info('✅ Action Bridge: STARTED')
+        self.get_logger().info('✅ Action Bridge: STARTED (Global Sanitizer Mode)')
 
     def setup_piggyback_clients(self):
         def create_cli(cls, topic):
@@ -107,42 +105,42 @@ class ActionBridge(Node):
         }
         self.homing_client = create_cli(PiggybackHoming, '/piggyback/home_all')
 
-    # ✅ FIXED: ใช้ subprocess เช็ค Process ตรงๆ เหมือน run_all.sh
     def check_node_health(self):
-        # 1. Check System Bringup
         bringup_live = self.is_process_running("system_bringup.launch.py")
-        
-        # 2. Check Modbus Launch
         modbus_live = self.is_process_running("modbus_node.launch.py")
-        
         self.robot_state["system_health"]["bringup"] = bringup_live
         self.robot_state["system_health"]["modbus"] = modbus_live
 
-    # ✅ Helper Function: pgrep -f "name"
     def is_process_running(self, process_name):
         try:
-            # return code 0 = found, 1 = not found
             return subprocess.call(["pgrep", "-f", process_name], stdout=subprocess.DEVNULL) == 0
         except:
             return False
 
-    # ... (ส่วนที่เหลือเหมือนเดิมทุกประการ) ...
     def update_piggy(self, key, msg):
         val = msg.data
         if val > 2147483647: val -= 4294967296
         self.robot_state["piggyback"][key] = val
 
     def odom_cb(self, msg): pass 
-    
-    def odom_qr_cb(self, msg):
-        self.robot_state["position"]["x"] = round(msg.pose.pose.position.x, 3)
-        self.robot_state["position"]["y"] = round(msg.pose.pose.position.y, 3)
-        q = msg.pose.pose.orientation
-        siny_cosp = 2 * (q.w * q.z + q.x * q.y)
-        cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
-        self.robot_state["position"]["th"] = round(math.atan2(siny_cosp, cosy_cosp) * 180.0 / math.pi, 1)
 
-    def qr_id_cb(self, msg): self.robot_state["qr_id"] = msg.data
+    def odom_qr_cb(self, msg):
+        try:
+            # คำนวณแบบดิบๆ ไปเลย (ถ้า NaN เดี๋ยวไปกรองตอนจบทีเดียว)
+            self.robot_state["position"]["x"] = round(msg.pose.pose.position.x, 3)
+            self.robot_state["position"]["y"] = round(msg.pose.pose.position.y, 3)
+            
+            q = msg.pose.pose.orientation
+            siny_cosp = 2 * (q.w * q.z + q.x * q.y)
+            cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
+            self.robot_state["position"]["th"] = round(math.atan2(siny_cosp, cosy_cosp) * 180.0 / math.pi, 1)
+        except:
+            pass 
+
+    def qr_id_cb(self, msg): 
+        # แปลงเป็น String เสมอ
+        self.robot_state["qr_id"] = str(msg.data)
+
     def flag_cb(self, msg): 
         self.robot_state["hardware"]["ff"] = msg.ff
         self.robot_state["hardware"]["fm1"] = msg.fm1
@@ -189,6 +187,7 @@ class ActionBridge(Node):
             self.get_logger().error(f'❌ JSON Error: {e}')
 
     def handle_piggyback_manual(self, data):
+        # ... (เหมือนเดิม) ...
         comp = int(data.get('component', -1))
         val = int(data.get('value', 0))
         current_slide = self.robot_state["piggyback"]["slide_pos"]
@@ -340,6 +339,7 @@ class ActionBridge(Node):
         self.cancel_action_timeout()
 
     def send_nav_goal(self, goal):
+        # ... (เหมือนเดิม) ...
         if not self.nav_client.wait_for_server(timeout_sec=1.0): return
         self.robot_state["active_action"] = "NAVIGATING"
         future = self.nav_client.send_goal_async(goal)
@@ -347,20 +347,17 @@ class ActionBridge(Node):
         self.start_action_timeout('NAVIGATION')
 
     def send_qr_goal(self, goal, mode_name):
+        # ... (เหมือนเดิม) ...
         if not self.qr_client.wait_for_server(timeout_sec=1.0): return
         self.robot_state["active_action"] = mode_name
         future = self.qr_client.send_goal_async(goal)
         future.add_done_callback(lambda f: self.handle_goal_response(f, "QR"))
         self.start_action_timeout(mode_name)
 
-    # ในไฟล์ action_bridge.py
     def execute_system_reset(self):
         self.get_logger().warn("🔄 SYSTEM RESET REQUESTED")
         self.robot_state["feedback_msg"] = "RESETTING SYSTEM..."
         self.publish_web_status()
-        
-        # ✅ วิธีแก้: ใช้ start_new_session=True เพื่อแยก Process ออกจาก Python
-        # แม้ Python (Action Bridge) จะโดนฆ่าตาย Script นี้จะยังทำงานต่อจนจบ
         import subprocess
         try:
              subprocess.Popen(
@@ -370,7 +367,7 @@ class ActionBridge(Node):
                  stdout=None, 
                  stderr=None, 
                  close_fds=True,
-                 start_new_session=True # <--- 🔑 กุญแจสำคัญคือบรรทัดนี้!
+                 start_new_session=True 
              )
         except Exception as e:
              self.get_logger().error(f"Reset Script Failed: {e}")
@@ -408,11 +405,33 @@ class ActionBridge(Node):
     def cancel_action_timeout(self):
         if self._action_timer: self._action_timer.cancel()
 
+    # 🔥🔥 MAGIC FUNCTION: ฟังก์ชันทำความสะอาดข้อมูล (Recursive) 🔥🔥
+    # มันจะเจาะเข้าไปทุกชั้นของ Dictionary ถ้าเจอ NaN/Inf จะเปลี่ยนเป็น 0.0 ทันที
+    def sanitize_for_json(self, obj):
+        if isinstance(obj, float):
+            if math.isnan(obj) or math.isinf(obj):
+                return 0.0
+            return obj
+        elif isinstance(obj, dict):
+            return {k: self.sanitize_for_json(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [self.sanitize_for_json(v) for v in obj]
+        return obj
+
+    # 🛡️🛡️🛡️ จุดดักจับสุดท้าย (The Final Gate) 🛡️🛡️🛡️
     def publish_web_status(self):
         self.robot_state["last_update"] = time.time()
-        msg = String()
-        msg.data = json.dumps(self.robot_state)
-        self.status_pub.publish(msg)
+        try:
+            # 1. ทำความสะอาดข้อมูลทั้งก้อนก่อนส่ง
+            clean_state = self.sanitize_for_json(self.robot_state)
+            
+            # 2. แปลงเป็น JSON (ตอนนี้ปลอดภัย 100% แล้ว)
+            msg = String()
+            msg.data = json.dumps(clean_state)
+            self.status_pub.publish(msg)
+        except Exception as e:
+            # ถ้ายังพังอีก (ซึ่งยากมาก) ให้ Log ไว้ แต่ห้ามตาย
+            self.get_logger().error(f"JSON Publish Failed: {e}")
 
 def main(args=None):
     rclpy.init(args=args)

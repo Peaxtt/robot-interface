@@ -11,103 +11,91 @@ function App() {
   const [controlMode, setControlMode] = useState('MANUAL'); 
   
   const [ros, setRos] = useState(null);
-  const [rosStatus, setRosStatus] = useState('DISCONNECTED'); 
+  // เปลี่ยน Default เป็น CONNECTING จะได้ไม่ดูน่ากลัว
+  const [rosStatus, setRosStatus] = useState('CONNECTING'); 
 
-  // --- Shared State (Memory Bank) ---
+  // --- Shared State ---
   const [sharedPath, setSharedPath] = useState([]); 
   const [sharedStep, setSharedStep] = useState(0);
   const [sharedLift, setSharedLift] = useState(0.0);
   const [sharedAngle, setSharedAngle] = useState(90);
 
-  // Refs for Connection Logic
   const rosInstance = useRef(null);
-  const reconnectTimer = useRef(null);
-  const watchdogTimer = useRef(null); 
   
+  // 🔥 CONFIG IP ตรงนี้
   const ROBOT_IP = '10.61.6.65'; 
   const ROS_PORT = '9090';
 
-  // --- 1. ROBUST CONNECTION LOGIC ---
+  // --- 1. SUPER ROBUST AUTO-RECONNECT ---
   useEffect(() => {
-    const ROS_URL = `ws://${ROBOT_IP}:${ROS_PORT}`; 
+    let retryTimeout = null;
 
     const connectROS = () => {
-      // Prevent double connection
-      if (rosInstance.current && (rosInstance.current.isConnected || rosInstance.current.socket?.readyState === 0)) {
-        return;
-      }
+      const ROS_URL = `ws://${ROBOT_IP}:${ROS_PORT}`;
 
-      console.log(`🔄 App: Connecting to ROS at ${ROS_URL}`);
-      setRosStatus('CONNECTING');
-
+      // ถ้ามีอันเก่าค้างอยู่ ให้ปิดก่อน
       if (rosInstance.current) {
         try { rosInstance.current.close(); } catch(e) {}
-        rosInstance.current = null;
       }
+
+      console.log(`🔄 App: Trying to connect to ${ROS_URL}...`);
+      // อย่าเพิ่งขึ้น Error ให้ขึ้นว่ากำลังพยายาม
+      setRosStatus('CONNECTING');
 
       try {
         const RosClass = ROSLIB.Ros || ROSLIB.default?.Ros;
         if (!RosClass) return;
 
         const newRos = new RosClass({ url: ROS_URL });
-        
+
+        // ✅ 1. เชื่อมต่อสำเร็จ
         newRos.on('connection', () => {
-          console.log('✅ App: ROS Connected');
+          console.log('✅ App: ROS Connected!');
           setRosStatus('CONNECTED');
-          setRos(newRos); 
+          setRos(newRos);
           rosInstance.current = newRos;
+          // ถ้าต่อติดแล้ว ให้เคลียร์ตัวจับเวลาถอยหลัง (ถ้ามี)
+          if (retryTimeout) clearTimeout(retryTimeout);
         });
 
+        // ❌ 2. เจอ Error (เช่น หลุดแวบเดียว)
         newRos.on('error', (error) => {
-          console.warn('⚠️ App: ROS Error'); // Less noise
-          setRosStatus('ERROR');
+          console.warn('⚠️ App: ROS Error (Will retry...)');
+          // ไม่ต้องขึ้น ERROR แดงเถือก ให้ขึ้นว่ากำลังลองใหม่
+          setRosStatus('RECONNECTING'); 
           setRos(null);
+          
+          // 🔥 ไม้ตาย: สั่งต่อใหม่เองใน 1 วินาที
+          if (retryTimeout) clearTimeout(retryTimeout);
+          retryTimeout = setTimeout(connectROS, 1000);
         });
 
+        // 🔌 3. การเชื่อมต่อหลุด (Close)
         newRos.on('close', () => {
-          console.log('🔌 App: ROS Connection closed');
-          setRosStatus('DISCONNECTED');
+          console.log('🔌 App: Connection closed (Will retry...)');
+          setRosStatus('RECONNECTING');
           setRos(null);
-          rosInstance.current = null; 
+
+          // 🔥 ไม้ตาย: สั่งต่อใหม่เองใน 1 วินาที
+          if (retryTimeout) clearTimeout(retryTimeout);
+          retryTimeout = setTimeout(connectROS, 1000);
         });
 
       } catch (err) {
-        console.error("ROS Init Failed:", err);
-        setRosStatus('ERROR');
+        console.error("ROS Init Failed, retrying...");
+        if (retryTimeout) clearTimeout(retryTimeout);
+        retryTimeout = setTimeout(connectROS, 1000);
       }
     };
 
-    // Initial Connect
+    // เริ่มทำงานครั้งแรก
     connectROS();
 
-    // ✅ Watchdog: Check every 3s
-    watchdogTimer.current = setInterval(() => {
-      const isConnected = rosInstance.current && rosInstance.current.isConnected;
-      if (!isConnected) {
-        console.log('🐶 Watchdog: Connection lost. Retrying...');
-        connectROS();
-      }
-    }, 3000);
-
-    // ✅ Visibility Listener: Reconnect immediately when app comes to foreground
-    const handleVisibilityChange = () => {
-      if (document.visibilityState === 'visible') {
-        const isConnected = rosInstance.current && rosInstance.current.isConnected;
-        if (!isConnected) {
-          console.log('👀 App visible -> Force Reconnect');
-          connectROS();
-        }
-      }
-    };
-    document.addEventListener('visibilitychange', handleVisibilityChange);
-
+    // Cleanup เมื่อปิดหน้าเว็บ
     return () => {
-      if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
-      if (watchdogTimer.current) clearInterval(watchdogTimer.current);
-      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      if (retryTimeout) clearTimeout(retryTimeout);
       if (rosInstance.current) {
         rosInstance.current.close();
-        rosInstance.current = null;
       }
     };
   }, []); 
@@ -115,32 +103,25 @@ function App() {
   // --- 2. SYSTEM RESET HANDLER ---
   const handleSystemReset = () => {
     if (!ros) return;
-    
-    // 1. Send Reset Command to Bridge
     const cmdTopic = new ROSLIB.Topic({
       ros: ros,
       name: '/web_command_gateway',
       messageType: 'std_msgs/String'
     });
-    
     const payload = JSON.stringify({ type: 'SYSTEM_RESET' });
     cmdTopic.publish({ data: payload });
-    
-    // 2. Force UI Reload after delay (Give time for backend to kill nodes)
-    // Backend will kill 'ros2 launch' processes.
-    // Ideally, we wait for user to re-launch or if using supervisor, it restarts.
-    // For now, we reload page to clear frontend state.
     setTimeout(() => {
-      alert("System Reset Command Sent. Reloading Interface...");
+      alert("System Reset Sent. Reloading...");
       window.location.reload();
     }, 2000);
   };
 
-  // UI Helpers
+  // UI Helpers (ปรับสีป้ายสถานะใหม่)
   const getStatusBadgeColor = () => {
     switch (rosStatus) {
       case 'CONNECTED': return 'bg-green-100 text-green-700 border-green-200';
-      case 'CONNECTING': return 'bg-yellow-100 text-yellow-700 border-yellow-200';
+      case 'CONNECTING': 
+      case 'RECONNECTING': return 'bg-yellow-100 text-yellow-700 border-yellow-200 animate-pulse'; // สีเหลืองกระพริบ
       case 'ERROR': return 'bg-red-100 text-red-700 border-red-200';
       default: return 'bg-slate-100 text-slate-500 border-slate-200';
     }
@@ -148,7 +129,6 @@ function App() {
 
   return (
     <div className="flex h-screen bg-slate-100 font-sans text-slate-900 selection:bg-blue-100">
-      {/* ✅ Pass Reset Handler to Sidebar */}
       <Sidebar activeTab={activeTab} setActiveTab={setActiveTab} onSystemReset={handleSystemReset} />
       
       <main className="flex-1 flex flex-col h-screen overflow-hidden relative">
@@ -159,7 +139,8 @@ function App() {
             </h1>
             <span className={`border text-[10px] px-2 py-0.5 rounded font-bold flex items-center gap-1 ${getStatusBadgeColor()}`}>
               <span className={`w-1.5 h-1.5 rounded-full ${rosStatus === 'CONNECTED' ? 'bg-green-500 animate-pulse' : 'bg-current'}`}></span>
-              {rosStatus}
+              {/* เปลี่ยนข้อความให้ดู Friendly ขึ้น */}
+              {rosStatus === 'RECONNECTING' ? 'RECONNECTING...' : rosStatus}
             </span>
           </div>
 
@@ -183,7 +164,6 @@ function App() {
 
         <div className="flex-1 p-6 overflow-hidden bg-slate-50/50 relative">
           
-          {/* TAB 1: MOBILE BASE */}
           <div className={`${activeTab === 'mobile' ? 'flex' : 'hidden'} flex-col gap-6 h-full`}>
               <div className="flex-[2] overflow-hidden relative">
                 <div className={`h-full w-full ${controlMode === 'MANUAL' ? 'block' : 'hidden'}`}>
@@ -202,7 +182,6 @@ function App() {
               </div>
           </div>
 
-          {/* TAB 2: PIGGYBACK */}
           <div className={`${activeTab === 'piggyback' ? 'block' : 'hidden'} h-full`}>
              <PiggybackControl 
                 ros={ros}
