@@ -270,7 +270,7 @@ const OpenLoopControl = ({ ros }) => {
       <div className={`mt-auto rounded-xl p-4 border-l-4 transition-all flex items-center gap-3 ${isLocked ? 'bg-red-50 border-red-500 text-red-600' : isBusy ? 'bg-purple-50 border-purple-500 text-purple-700' : 'bg-blue-50 border-blue-400 text-blue-600'}`}>
          <div className={`w-3 h-3 rounded-full ${isLocked ? 'bg-red-500 animate-pulse' : isBusy ? 'bg-purple-500 animate-spin' : 'bg-blue-500 animate-pulse'}`} />
          <div className="flex flex-col">
-           <span className="text-[10px] font-bold uppercase">System Status</span>
+           <span className="text-[10px] font-bold uppercase">Manual Status</span>
            <span className="text-sm font-bold tracking-tight">
               {isLocked ? 'ENGINE LOCKED' : isBusy ? `EXECUTING: ${alignStatus}` : 'READY TO JOG'}
            </span>
