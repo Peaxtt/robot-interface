@@ -8,10 +8,10 @@ import {
 const PiggybackSequencer = ({ ros }) => {
   // --- STATE ---
   const [direction, setDirection] = useState(1); // 1=Left, 2=Right (ตาม CLI: LEFT=1, RIGHT=2)
-  const [robotShelf, setRobotShelf] = useState(0); // 0, 1, 2, 3
-  const [liftHeight, setLiftHeight] = useState(815.0); 
+  const [robotShelf, setRobotShelf] = useState(0); // 0, 1, 2, 3 (Slot ของ Robot)
+  const [liftHeight, setLiftHeight] = useState(850.0); 
   const [isEditingHeight, setIsEditingHeight] = useState(false); 
-  const [tempHeight, setTempHeight] = useState(815.0);
+  const [tempHeight, setTempHeight] = useState(850.0);
 
   // Status จาก Robot
   const [robotStatus, setRobotStatus] = useState({ 
@@ -21,10 +21,10 @@ const PiggybackSequencer = ({ ros }) => {
 
   // --- PRESETS ---
   const HEIGHT_PRESETS = [
-    { label: 'LEVEL 4', value: 1100.0, color: 'bg-purple-500' },
-    { label: 'LEVEL 3', value: 815.0,  color: 'bg-blue-500' },
-    { label: 'LEVEL 2', value: 550.0,  color: 'bg-teal-500' },
-    { label: 'LEVEL 1', value: 250.0,  color: 'bg-slate-500' },
+    { label: 'LEVEL 4', value: 1650.0, color: 'bg-purple-500' },
+    { label: 'LEVEL 3', value: 1250.0,  color: 'bg-blue-500' },
+    { label: 'LEVEL 2', value: 850.0,  color: 'bg-teal-500' },
+    { label: 'LEVEL 1', value: 450.0,  color: 'bg-slate-500' },
   ];
 
   // --- SUBSCRIBE STATUS ---
@@ -91,7 +91,7 @@ const PiggybackSequencer = ({ ros }) => {
            <div className="p-2 bg-blue-100 text-blue-600 rounded-lg"><Play size={20} fill="currentColor"/></div>
            <div>
              <h2 className="font-black text-lg leading-tight">AUTO SEQUENCER</h2>
-             <p className="text-[10px] font-bold text-slate-400">TRANSPORT TOTE v1.5</p>
+             <p className="text-[10px] font-bold text-slate-400">TRANSPORT TOTE</p>
            </div>
         </div>
         {isRunning && (
@@ -142,7 +142,7 @@ const PiggybackSequencer = ({ ros }) => {
                               ${robotShelf === slot ? 'bg-white border-blue-500 shadow-md text-blue-700' : 'bg-transparent border-transparent text-slate-400 hover:bg-white/50'}`}>
                               <div className="flex items-center gap-3">
                                   <Box size={16} strokeWidth={2.5}/>
-                                  <span className="font-bold text-sm">SLOT {slot}</span>
+                                  <span className="font-bold text-sm">SLOT {slot+1}</span>
                               </div>
                               {robotShelf === slot && <div className="w-2 h-2 bg-blue-500 rounded-full animate-pulse"/>}
                           </button>
